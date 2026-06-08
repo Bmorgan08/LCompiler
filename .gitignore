@@ -1,0 +1,6 @@
+node_modules/
+dist/
+output/
+output.asm
+_test.asm
+*.js.map

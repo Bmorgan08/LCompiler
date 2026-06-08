@@ -1,0 +1,146 @@
+{
+  "name": "L",
+  "scopeName": "source.l",
+  "fileTypes": ["l"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#builtins" },
+    { "include": "#struct-declaration" },
+    { "include": "#function-declaration" },
+    { "include": "#method-declaration" },
+    { "include": "#struct-field" },
+    { "include": "#numbers" },
+    { "include": "#operators" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.l",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.l",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.l",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.l",
+          "match": "\\b(if|else|while|for|break|continue|return)\\b"
+        },
+        {
+          "name": "keyword.declaration.l",
+          "match": "\\b(var|function|fn|struct|extends|overrides|new|const)\\b"
+        },
+        {
+          "name": "variable.language.l",
+          "match": "\\bthis\\b"
+        }
+      ]
+    },
+    "types": {
+      "name": "storage.type.l",
+      "match": "\\b(int|bool|string)\\b(?=\\s*[\\[\\]\\w])"
+    },
+    "builtins": {
+      "name": "support.function.builtin.l",
+      "match": "\\b(print|printchar|input|inputstr|len|strtoint|inttostr)\\b(?=\\s*\\()"
+    },
+    "struct-declaration": {
+      "match": "\\b(struct)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(extends)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
+      "captures": {
+        "1": { "name": "keyword.declaration.l" },
+        "2": { "name": "entity.name.type.struct.l" },
+        "3": { "name": "keyword.declaration.l" },
+        "4": { "name": "entity.name.type.struct.l" }
+      }
+    },
+    "function-declaration": {
+      "match": "\\b(function)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.l" },
+        "2": { "name": "entity.name.function.l" }
+      }
+    },
+    "method-declaration": {
+      "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.l" },
+        "2": { "name": "entity.name.function.l" }
+      }
+    },
+    "struct-field": {
+      "match": "\\b(var|const)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*:",
+      "captures": {
+        "1": { "name": "keyword.declaration.l" },
+        "2": { "name": "variable.other.member.l" }
+      }
+    },
+    "numbers": {
+      "name": "constant.numeric.l",
+      "match": "-?\\b[0-9]+\\b"
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.comparison.l",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.l",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.arithmetic.l",
+          "match": "[+\\-*/%]"
+        },
+        {
+          "name": "keyword.operator.assignment.l",
+          "match": "="
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "match": "([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.call.l" }
+          }
+        },
+        {
+          "match": "(?<=[A-Za-z0-9_\\]\\)])(\\.)(len)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "punctuation.accessor.l" },
+            "2": { "name": "support.function.builtin.l" }
+          }
+        },
+        {
+          "match": "(?<=[A-Za-z0-9_\\]\\)])(\\.)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.l" },
+            "2": { "name": "variable.other.member.l" }
+          }
+        },
+        {
+          "name": "variable.other.l",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    }
+  }
+}

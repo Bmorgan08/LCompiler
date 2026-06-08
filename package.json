@@ -1,0 +1,31 @@
+{
+  "name": "l-language",
+  "displayName": "L Language",
+  "description": "Syntax highlighting and language intelligence for the L programming language",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.74.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:l"],
+  "main": "./client/out/extension.js",
+  "contributes": {
+    "languages": [{
+      "id": "l",
+      "aliases": ["L", "l"],
+      "extensions": [".l"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "l",
+      "scopeName": "source.l",
+      "path": "./syntaxes/l.tmLanguage.json"
+    }]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/vscode": "^1.74.0",
+    "@types/node": "^20.0.0"
+  }
+}
