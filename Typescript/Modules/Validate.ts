@@ -430,7 +430,6 @@ export function validate(node: Node, scope: Scope) {
         }
 
         case "ForIn": {
-            // node.value = loop var name, children[0] = array expr, children[1] = body
             const forInScope = createScope(scope);
             validate(node.children[0], scope);
             const arrType = inferType(node.children[0], scope);
@@ -441,15 +440,12 @@ export function validate(node: Node, scope: Scope) {
         }
 
         case "Match": {
-            // children[0] = subject, rest = MatchArm
             validate(node.children[0], scope);
             node.children.slice(1).forEach(arm => {
                 const armScope = createScope(scope);
                 if (arm.value === "_") {
-                    // wildcard: children[0] = body
                     validate(arm.children[0], armScope);
                 } else {
-                    // children[0] = pattern expr, children[1] = body
                     validate(arm.children[0], armScope);
                     validate(arm.children[1], armScope);
                 }

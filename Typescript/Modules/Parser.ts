@@ -59,8 +59,6 @@ export interface Node {
     col?: number;
 }
 
-// ─── Token stream helpers ────────────────────────────────────────────────────
-
 function peek(t: Token[]): string { return t[0]?.value ?? ""; }
 function peekTok(t: Token[]): Token | undefined { return t[0]; }
 function eat(t: Token[]): string { return t.shift()!.value; }
@@ -79,8 +77,6 @@ function node(type: NodeType, tok: Token | undefined, extras: Partial<Node> = {}
     return { type, children: [], line: tok?.line, col: tok?.col, ...extras };
 }
 
-// ─── Expression parser ───────────────────────────────────────────────────────
-
 function parseExpression(tokens: Token[]): Node {
     function primary(): Node {
         const tok = eatTok(tokens);
@@ -88,7 +84,7 @@ function parseExpression(tokens: Token[]): Node {
         const t = tok.value;
 
         if (t === "this") {
-            eat(tokens); // .
+            eat(tokens);
             const field = eat(tokens);
             if (peek(tokens) === "(") {
                 eat(tokens);
@@ -109,32 +105,30 @@ function parseExpression(tokens: Token[]): Node {
                 elements.push(parseExpression(tokens));
                 if (peek(tokens) === ",") eat(tokens);
             }
-            eat(tokens); // ]
+            eat(tokens);
             return { type: "ArrayLiteral", children: elements, line: tok.line, col: tok.col };
         }
 
         if (t === "(") {
-            // Could be tuple: (expr, expr, ...) or grouped expr
             const first = parseExpression(tokens);
             if (peek(tokens) === ",") {
-                // tuple
                 const elems: Node[] = [first];
                 while (peek(tokens) === ",") {
                     eat(tokens);
                     elems.push(parseExpression(tokens));
                 }
-                eat(tokens); // )
+                eat(tokens);
                 return { type: "Tuple", children: elems, line: tok.line, col: tok.col };
             }
-            eat(tokens); // )
+            eat(tokens);
             return first;
         }
 
         if (t === "new") {
-            eat(tokens); // type name e.g. int
-            eat(tokens); // [
+            eat(tokens);
+            eat(tokens);
             const rows = parseExpression(tokens);
-            eat(tokens); // ]
+            eat(tokens);
             if (peek(tokens) === "[") {
                 eat(tokens);
                 const cols = parseExpression(tokens);
@@ -148,7 +142,6 @@ function parseExpression(tokens: Token[]): Node {
         if (t === "false") return { type: "Number", value: "0", varType: "bool", children: [], line: tok.line, col: tok.col };
 
         if (t.startsWith("'") && t.endsWith("'") && t.length === 3) {
-            // char literal 'x' — store as the character
             return { type: "Char", value: t[1], children: [], line: tok.line, col: tok.col };
         }
 
@@ -173,7 +166,6 @@ function parseExpression(tokens: Token[]): Node {
         }
 
         if (t === "++" || t === "--") {
-            // prefix inc/dec — treat as compound assign
             const operand = primary();
             return { type: "CompoundAssign", value: t === "++" ? "+=" : "-=", children: [operand, { type: "Number", value: "1", children: [] }], line: tok.line, col: tok.col };
         }
@@ -184,7 +176,7 @@ function parseExpression(tokens: Token[]): Node {
                 const fields: Node[] = [];
                 while (peek(tokens) !== "}") {
                     const fieldName = eat(tokens);
-                    eat(tokens); // :
+                    eat(tokens);
                     const val = parseExpression(tokens);
                     fields.push({ type: "StructField", value: fieldName, children: [val] });
                     if (peek(tokens) === ",") eat(tokens);
@@ -205,17 +197,16 @@ function parseExpression(tokens: Token[]): Node {
             }
 
             if (peek(tokens) === ".") {
-                // tuple element access: t.0, t.1, ... (digit after dot)
                 if (/^\d+$/.test(tokens[1]?.value ?? "")) {
-                    eat(tokens); // .
+                    eat(tokens);
                     const idx = eat(tokens);
                     return { type: "TupleAccess", value: idx, children: [{ type: "Identifier", value: t, children: [] }], line: tok.line, col: tok.col };
                 }
-                eat(tokens); // .
+                eat(tokens);
                 const member = eat(tokens);
                 if (member === "len") {
-                    eat(tokens); // (
-                    eat(tokens); // )
+                    eat(tokens);
+                    eat(tokens);
                     return { type: "ArrayLen", value: t, children: [], line: tok.line, col: tok.col };
                 }
                 if (peek(tokens) === "(") {
@@ -234,14 +225,13 @@ function parseExpression(tokens: Token[]): Node {
             if (peek(tokens) === "[") {
                 eat(tokens);
                 const index = parseExpression(tokens);
-                // slice: arr[i..j]
                 if (peek(tokens) === "..") {
                     eat(tokens);
                     const end = parseExpression(tokens);
-                    eat(tokens); // ]
+                    eat(tokens);
                     return { type: "ArraySlice", value: t, children: [index, end], line: tok.line, col: tok.col };
                 }
-                eat(tokens); // ]
+                eat(tokens);
                 if (peek(tokens) === "[") {
                     eat(tokens);
                     const index2 = parseExpression(tokens);
@@ -251,7 +241,6 @@ function parseExpression(tokens: Token[]): Node {
                 return { type: "ArrayAccess", value: t, children: [index], line: tok.line, col: tok.col };
             }
 
-            // postfix ++ / --
             if (peek(tokens) === "++" || peek(tokens) === "--") {
                 const op = eat(tokens);
                 const nodeType = op === "++" ? "PostfixInc" : "PostfixDec";
@@ -267,7 +256,6 @@ function parseExpression(tokens: Token[]): Node {
     function assignment(): Node {
         const left = primary();
 
-        // compound assignment: +=, -=, *=, /=, %=
         const compOps = ["+=", "-=", "*=", "/=", "%="];
         if (compOps.includes(peek(tokens))) {
             const op = eat(tokens);
@@ -336,12 +324,7 @@ function parseTypeAnnotation(tokens: Token[]): Ltype | undefined {
     return undefined;
 }
 
-// ─── Top-level parse ─────────────────────────────────────────────────────────
-
 export function parse(rawTokens: string[]): Node {
-    // Re-lex from source is impossible here; accept pre-tokenised string array
-    // by wrapping into synthetic Token objects with no position.
-    // The real position-aware path goes through parseWithPos.
     const tokens: Token[] = rawTokens.map(v => ({ value: v, line: 0, col: 0 }));
     return parseTokens(tokens);
 }
@@ -362,22 +345,22 @@ function parseTokens(tokens: Token[]): Node {
         if (t === "for") { eat(tokens); return parseFor(); }
         if (t === "match") { eat(tokens); return parseMatch(); }
         if (t === "asm") {
-            const atok = eatTok(tokens); // asm
-            eat(tokens); // {
-            const rawTok = eatTok(tokens); // __asm__:...
-            eat(tokens); // }
+            const atok = eatTok(tokens);
+            eat(tokens);
+            const rawTok = eatTok(tokens);
+            eat(tokens);
             const raw = rawTok.value.slice("__asm__:".length);
             return { type: "AsmBlock", value: raw, children: [], line: atok.line, col: atok.col };
         }
 
         if (t === "break") {
             const btok = eatTok(tokens);
-            eat(tokens); // ;
+            eat(tokens);
             return { type: "Break", children: [], line: btok.line, col: btok.col };
         }
         if (t === "continue") {
             const ctok = eatTok(tokens);
-            eat(tokens); // ;
+            eat(tokens);
             return { type: "Continue", children: [], line: ctok.line, col: ctok.col };
         }
 
@@ -393,19 +376,17 @@ function parseTokens(tokens: Token[]): Node {
             const vtok = eatTok(tokens);
             const varType = parseTypeAnnotation(tokens);
             const name = eat(tokens);
-            eat(tokens); // =
+            eat(tokens);
             const exprTokens: Token[] = [];
             while (peek(tokens) !== ";") exprTokens.push(eatTok(tokens)!);
             eat(tokens);
             return { type: "VarDecl", value: name, varType, children: [parseExpression(exprTokens)], line: vtok.line, col: vtok.col };
         }
 
-        // collect up to ;
         const exprTokens: Token[] = [];
         while (peek(tokens) !== ";") exprTokens.push(eatTok(tokens)!);
         eat(tokens);
 
-        // 2D array assign: name[i][j] = expr
         const eqIdx = exprTokens.map(t => t.value).lastIndexOf("=");
         const firstBracketIdx = exprTokens.findIndex(t => t.value === "[");
         if (eqIdx > 0 && firstBracketIdx > 0 && firstBracketIdx < eqIdx &&
@@ -444,7 +425,6 @@ function parseTokens(tokens: Token[]): Node {
             }
         }
 
-        // field assign: obj.field = expr
         const dotIdx = exprTokens.findIndex(t => t.value === ".");
         if (dotIdx === 1 && eqIdx > dotIdx && exprTokens[eqIdx - 1]?.value !== "<" &&
             exprTokens[eqIdx - 1]?.value !== ">" && exprTokens[eqIdx - 1]?.value !== "!" &&
@@ -459,7 +439,6 @@ function parseTokens(tokens: Token[]): Node {
             };
         }
 
-        // compound assign as statement: x += expr
         const compOpIdx = exprTokens.findIndex(t => ["+=", "-=", "*=", "/=", "%="].includes(t.value));
         if (compOpIdx === 1) {
             const name = exprTokens[0].value;
@@ -472,7 +451,6 @@ function parseTokens(tokens: Token[]): Node {
             };
         }
 
-        // postfix ++ / -- as statement: i++; or i--;
         if (exprTokens.length === 2 && (exprTokens[1].value === "++" || exprTokens[1].value === "--")) {
             const name = exprTokens[0].value;
             const op = exprTokens[1].value === "++" ? "+=" : "-=";
@@ -491,7 +469,7 @@ function parseTokens(tokens: Token[]): Node {
 
     function parseWhile(): Node {
         const wtok = peekTok(tokens);
-        eat(tokens); // (
+        eat(tokens);
         const condTokens: Token[] = [];
         let depth = 1;
         while (depth > 0) {
@@ -501,30 +479,28 @@ function parseTokens(tokens: Token[]): Node {
             condTokens.push(tok);
         }
         const cond = parseExpression(condTokens);
-        eat(tokens); // {
+        eat(tokens);
         const body = parseBlockBody();
-        eat(tokens); // }
+        eat(tokens);
         return { type: "While", children: [cond, body], line: wtok?.line, col: wtok?.col };
     }
 
     function parseFor(): Node {
         const ftok = peekTok(tokens);
-        eat(tokens); // (
+        eat(tokens);
 
-        // Peek ahead for `for x in arr` pattern
-        // Detect: identifier "in" without a ; before "in"
         const saved = [...tokens];
         const firstTok = tokens[0]?.value;
         const secondTok = tokens[1]?.value;
         if (firstTok && /^[a-zA-Z_]/.test(firstTok) && secondTok === "in") {
-            const varName = eat(tokens); // varName
-            eat(tokens); // in
+            const varName = eat(tokens);
+            eat(tokens);
             const iterTokens: Token[] = [];
             while (peek(tokens) !== ")") iterTokens.push(eatTok(tokens)!);
-            eat(tokens); // )
-            eat(tokens); // {
+            eat(tokens);
+            eat(tokens);
             const body = parseBlockBody();
-            eat(tokens); // }
+            eat(tokens);
             return {
                 type: "ForIn",
                 value: varName,
@@ -544,9 +520,9 @@ function parseTokens(tokens: Token[]): Node {
         const updateTokens: Token[] = [];
         while (peek(tokens) !== "{") updateTokens.push(eatTok(tokens)!);
 
-        eat(tokens); // {
+        eat(tokens);
         const body = parseBlockBody();
-        eat(tokens); // }
+        eat(tokens);
 
         let init: Node | null = null;
         if (initTokens.length) {
@@ -564,7 +540,7 @@ function parseTokens(tokens: Token[]): Node {
                     }
                 }
                 const name = initTokens[offset++].value;
-                offset++; // =
+                offset++;
                 const exprTokens = initTokens.slice(offset);
                 init = { type: "VarDecl", value: name, varType, children: [parseExpression(exprTokens)] };
             } else {
@@ -585,7 +561,7 @@ function parseTokens(tokens: Token[]): Node {
 
     function parseMatch(): Node {
         const mtok = peekTok(tokens);
-        eat(tokens); // (
+        eat(tokens);
         const subjTokens: Token[] = [];
         let depth = 1;
         while (depth > 0) {
@@ -595,29 +571,28 @@ function parseTokens(tokens: Token[]): Node {
             subjTokens.push(tok);
         }
         const subject = parseExpression(subjTokens);
-        eat(tokens); // {
+        eat(tokens);
         const arms: Node[] = [];
         while (peek(tokens) !== "}") {
             if (peek(tokens) === "_") {
-                // wildcard arm
-                eat(tokens); // _
-                eat(tokens); // =>
-                eat(tokens); // {
+                eat(tokens);
+                eat(tokens);
+                eat(tokens);
                 const body = parseBlockBody();
-                eat(tokens); // }
+                eat(tokens);
                 arms.push({ type: "MatchArm", value: "_", children: [body] });
             } else {
                 const patternTokens: Token[] = [];
                 while (peek(tokens) !== "=>" && peek(tokens) !== "}") patternTokens.push(eatTok(tokens)!);
-                eat(tokens); // =>
-                eat(tokens); // {
+                eat(tokens);
+                eat(tokens);
                 const body = parseBlockBody();
-                eat(tokens); // }
+                eat(tokens);
                 const pattern = parseExpression(patternTokens);
                 arms.push({ type: "MatchArm", children: [pattern, body] });
             }
         }
-        eat(tokens); // }
+        eat(tokens);
         return { type: "Match", children: [subject, ...arms], line: mtok?.line, col: mtok?.col };
     }
 
@@ -625,7 +600,7 @@ function parseTokens(tokens: Token[]): Node {
         const name = eat(tokens);
         let parent: string | undefined;
         if (peek(tokens) === "extends") { eat(tokens); parent = eat(tokens); }
-        eat(tokens); // {
+        eat(tokens);
 
         const fields: Node[] = [];
         const methods: Node[] = [];
@@ -635,30 +610,30 @@ function parseTokens(tokens: Token[]): Node {
             const t = peek(tokens);
             if (t === "overrides") {
                 eat(tokens);
-                eat(tokens); // {
+                eat(tokens);
                 while (peek(tokens) !== "}") overrides.push(parseStructMethod());
-                eat(tokens); // }
+                eat(tokens);
                 continue;
             }
             if (t === "fn") { methods.push(parseStructMethod()); continue; }
 
             const mut = eat(tokens);
             const fieldName = eat(tokens);
-            eat(tokens); // :
+            eat(tokens);
             const fieldType = eat(tokens) as Ltype;
-            eat(tokens); // ;
+            eat(tokens);
             const f: Node = { type: "StructField", value: fieldName, varType: fieldType, children: [] };
             if (mut === "const") f.isConst = true;
             fields.push(f);
         }
-        eat(tokens); // }
+        eat(tokens);
         return { type: "StructDef", value: name, parent, children: [...fields, ...methods, ...overrides] };
     }
 
     function parseStructMethod(): Node {
-        eat(tokens); // fn
+        eat(tokens);
         const name = eat(tokens);
-        eat(tokens); // (
+        eat(tokens);
 
         const params: Node[] = [];
         while (peek(tokens) !== ")") {
@@ -676,15 +651,15 @@ function parseTokens(tokens: Token[]): Node {
             }
             params.push({ type: "Identifier", value: p, children: [] });
         }
-        eat(tokens); // )
-        eat(tokens); // {
+        eat(tokens);
+        eat(tokens);
         const body = parseBlockBody();
-        eat(tokens); // }
+        eat(tokens);
         return { type: "StructMethod", value: name, children: [...params, body] };
     }
 
     function parseIf(): Node {
-        eat(tokens); // (
+        eat(tokens);
         const condTokens: Token[] = [];
         let depth = 1;
         while (depth > 0) {
@@ -694,9 +669,9 @@ function parseTokens(tokens: Token[]): Node {
             condTokens.push(tok);
         }
         const cond = parseExpression(condTokens);
-        eat(tokens); // {
+        eat(tokens);
         const thenBlock = parseBlockBody();
-        eat(tokens); // }
+        eat(tokens);
 
         const children: Node[] = [cond, thenBlock];
         if (peek(tokens) === "else") {
@@ -719,10 +694,8 @@ function parseTokens(tokens: Token[]): Node {
             const p = eat(tokens)!;
             if (p === ",") continue;
             if (p === "...") {
-                // variadic: ...name
                 const vname = eat(tokens)!;
                 params.push({ type: "Identifier", value: vname, varType: "int[]" as Ltype, children: [], isConst: false });
-                // mark as variadic via a special convention
                 params[params.length - 1].value = "..." + vname;
                 continue;
             }
@@ -748,12 +721,12 @@ function parseTokens(tokens: Token[]): Node {
 
         if (t === "function" || t === "fn") {
             const name = eat(tokens);
-            eat(tokens); // (
+            eat(tokens);
             const params = parseFunctionParams();
-            eat(tokens); // )
-            eat(tokens); // {
+            eat(tokens);
+            eat(tokens);
             const body = parseBlockBody();
-            eat(tokens); // }
+            eat(tokens);
             program.children.push({ type: "Function", value: name, children: [...params, body], line: tok.line, col: tok.col });
             continue;
         }
@@ -764,19 +737,20 @@ function parseTokens(tokens: Token[]): Node {
         }
 
         if (t === "var") {
+            const varType = parseTypeAnnotation(tokens);
             const name = eat(tokens)!;
-            eat(tokens); // =
+            eat(tokens);
             const expr: Token[] = [];
             while (peek(tokens) !== ";") expr.push(eatTok(tokens)!);
             eat(tokens);
-            program.children.push({ type: "VarDecl", value: name, children: [parseExpression(expr)], line: tok.line, col: tok.col });
+            program.children.push({ type: "VarDecl", value: name, varType, children: [parseExpression(expr)], line: tok.line, col: tok.col });
             continue;
         }
 
         if (t === "main") {
-            eat(tokens); eat(tokens); eat(tokens); // ( ) {
+            eat(tokens); eat(tokens); eat(tokens);
             const body = parseBlockBody();
-            eat(tokens); // }
+            eat(tokens);
             program.children.push({ type: "Function", value: "main", children: [body], line: tok.line, col: tok.col });
             continue;
         }

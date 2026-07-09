@@ -2,14 +2,12 @@ import { lookup } from "node:dns/promises";
 import { Node } from "./Parser";
 import { lookupStruct } from "./Scope";
 
-export type IR = 
-    // Control flow
+export type IR =
     | {op: "label", name: string}
     | {op: "jmp", target: string}
-    | {op: "jz", cond: string, target: string}   // jump if zero
-    | {op: "jnz", cond: string, target: string}  // jump if not zero
-    | {op: "call", dst?: string, fn: string, args: string[], returns_string?: boolean, returns_float?: boolean}  // dst is optional for void functions
-    // comparison
+    | {op: "jz", cond: string, target: string}
+    | {op: "jnz", cond: string, target: string}
+    | {op: "call", dst?: string, fn: string, args: string[], returns_string?: boolean, returns_float?: boolean}
     | {op: "eq", dst: string, a: string, b: string}
     | {op: "neq", dst: string, a: string, b: string}
     | {op: "lt", dst: string, a: string, b: string}
@@ -18,39 +16,33 @@ export type IR =
     | {op: "gte", dst: string, a: string, b: string}
     | {op: "str_eq", dst: string, a: string, b: string}
     | {op: "str_neq", dst: string, a: string, b: string}
-    // arithmetic
     | {op: "add", dst: string, a: string, b: string}
     | {op: "sub", dst: string, a: string, b: string}
     | {op: "mul", dst: string, a: string, b: string}
     | {op: "div", dst: string, a: string, b: string}
-    // bitwise and logical
     | {op: "and", dst: string, a: string, b: string}
     | {op: "or", dst: string, a: string, b: string}
     | {op: "xor", dst: string, a: string, b: string}
     | {op: "not", dst: string, src: string}
-    | {op: "shl", dst: string, a: string, b: string}  // shift left
-    | {op: "shr", dst: string, a: string, b: string}  // shift right
-    // Memory/Heap
-    | {op: "load", dst: string, addr: string, type: string}          // *addr → dst
-    | {op: "store", addr: string, src: string, type: string}         // src → *addr
-    | {op: "alloc", dst: string, size: string | number}         // heap alloc
+    | {op: "shl", dst: string, a: string, b: string}
+    | {op: "shr", dst: string, a: string, b: string}
+    | {op: "load", dst: string, addr: string, type: string}
+    | {op: "store", addr: string, src: string, type: string}
+    | {op: "alloc", dst: string, size: string | number}
     | {op: "free", addr: string}
-    | {op: "lea", dst: string, base: string, offset: string}  // address arithmetic
-    | {op: "mov", dst: string, src: string}              // register copy
-    | {op: "const", dst: string, value: number | string}  // load constant
-    | {op: "ret", value?: string}                         // return from function
-    | {op: "str_concat", dst: string, a: string, b: string}  // dst = a + b (for strings)
-    // Type/casting
+    | {op: "lea", dst: string, base: string, offset: string}
+    | {op: "mov", dst: string, src: string}
+    | {op: "const", dst: string, value: number | string}
+    | {op: "ret", value?: string}
+    | {op: "str_concat", dst: string, a: string, b: string}
     | {op: "cast", dst: string, src: string, type: string}
     | {op: "typeof", dst: string, src: string}
-    | {op: "string_const", dst: string, value: string}  // for string literals
-    // Functions / stack frames
-    | {op: "enter", name: string, params: string[]}   // function prologue
-    | {op: "leave"}                                    // function epilogue  
-    | {op: "arg", dst: string, index: number, isFloat?: boolean}  // read incoming arg by position
-    // Float ops
-    | {op: "itof", dst: string, src: string}           // int → float
-    | {op: "ftoi", dst: string, src: string}           // float → int
+    | {op: "string_const", dst: string, value: string}
+    | {op: "enter", name: string, params: string[]}
+    | {op: "leave"}
+    | {op: "arg", dst: string, index: number, isFloat?: boolean}
+    | {op: "itof", dst: string, src: string}
+    | {op: "ftoi", dst: string, src: string}
     | {op: "fadd", dst: string, a: string, b: string}
     | {op: "fsub", dst: string, a: string, b: string}
     | {op: "fmul", dst: string, a: string, b: string}
@@ -62,40 +54,36 @@ export type IR =
     | {op: "feq",  dst: string, a: string, b: string}
     | {op: "fneq", dst: string, a: string, b: string}
     | {op: "fneg", dst: string, src: string}
-    | {op: "fconst", dst: string, value: number}       // float constant
-    // Debugging / metadata (invaluable for error messages)
+    | {op: "fconst", dst: string, value: number}
     | {op: "srcmap", file: string, line: number, col: number}
     | {op: "comment", text: string}
-    // Misc
     | {op: "nop"}
-    | {op: "asm_verbatim", text: string}  // raw inline asm passthrough
-    | {op: "phi", dst: string, branches: {label: string, src: string}[]}  // SSA φ-node
-    | {op: "neg", dst: string, src: string}   // unary negation
+    | {op: "asm_verbatim", text: string}
+    | {op: "phi", dst: string, branches: {label: string, src: string}[]}
+    | {op: "neg", dst: string, src: string}
     | {op: "abs", dst: string, src: string}
     | {op: "mod", dst: string, a: string, b: string}
-    // arrays
     | {op: "array_new", dst: string, size: string | number}
     | {op: "array_store", arr: string, index: string, src: string}
     | {op: "array_load", dst: string, arr: string, index: string}
     | {op: "array_len", dst: string, arr: string}
-    | {op: "array_free_2d", arr: string, rows: string | number}  // free each row then the outer array
-    // structs
-    | {op: "struct_alloc", dst: string, structName: string, numFields: number}  // malloc struct
-    | {op: "field_store", base: string, offset: number, src: string}            // base[offset] = src
-    | {op: "field_load", dst: string, base: string, offset: number, is_string?: boolean}             // dst = base[offset]
-    | {op: "vtable_call", dst: string, base: string, slot: number, args: string[]} // virtual dispatch
-    | {op: "vtable_ptr", dst: string, structName: string}  // load address of vtable
+    | {op: "array_free_2d", arr: string, rows: string | number}
+    | {op: "struct_alloc", dst: string, structName: string, numFields: number}
+    | {op: "field_store", base: string, offset: number, src: string}
+    | {op: "field_load", dst: string, base: string, offset: number, is_string?: boolean}
+    | {op: "vtable_call", dst: string, base: string, slot: number, args: string[]}
+    | {op: "vtable_ptr", dst: string, structName: string}
     | {op: "vtable_entry", structName: string, methodName: string, implName: string}
 
 export function IRGen(ast: Node): IR[] {
     const instructions: IR[] = [];
     let tempCount = 0;
     let labelCount = 0;
-    const stringVars = new Set<string>();  // Map from string literal to variable name
-    const floatTemps = new Set<string>(); // track float-typed temporaries
+    const stringVars = new Set<string>();
+    const floatTemps = new Set<string>();
     const loopStack: { startLabel: string, endLabel: string }[] = [];
-    const stringFunctions = new Set<string>(); // Track functions that return strings
-    const floatFunctions = new Set<string>(); // Track functions that return floats
+    const stringFunctions = new Set<string>();
+    const floatFunctions = new Set<string>();
     const StructLayouts = new Map<string, Map<String, number>>()
     const vtableSlots = new Map<string, Map<string, number>>()
     const structTypeMap = new Map<string, string>()
@@ -160,7 +148,6 @@ export function IRGen(ast: Node): IR[] {
         if (producer.op === "arg") return stringVars.has(name);
         if (producer.op === "mov") {
             const src = (producer as any).src;
-            // don't follow movs from scanner/input slots
             if (!isNaN(Number(src))) return false;
             return isStringTemp(src);
         }
@@ -195,13 +182,13 @@ export function IRGen(ast: Node): IR[] {
                 .filter(c => c.type === "Identifier" && c.varType === "float")
                 .map(c => c.value!)
         );
-        // Collect float-typed local variables from VarDecl nodes in the body
         function collectFloatLocals(n: Node) {
             if (n.type === "VarDecl" && n.varType === "float") floatVarNames.add(n.value!);
             n.children.forEach(collectFloatLocals);
         }
         const body = node.children.find(c => c.type === "Block");
         if (body) collectFloatLocals(body);
+
 
         function isFloatExpr(n: Node): boolean {
             if (n.type === "Number" && n.varType === "float") return true;
@@ -244,7 +231,6 @@ export function IRGen(ast: Node): IR[] {
         return node.children.some(c => functionReturnsString(c, localStringVars));
     }
 
-    // Returns the register holding the result
     function genExpr(node: Node): string {
         switch (node.type) {
 
@@ -257,14 +243,12 @@ export function IRGen(ast: Node): IR[] {
                 const hasVtable = def.methods.size > 0
                 emit({ op: "struct_alloc", dst, structName: node.value!, numFields: def.fields.length + (hasVtable ? 1:0)});
 
-                // only emit vtable pointer if struct has methods
                 if (def.methods.size > 0) {
                     const vtablePtr = fresh();
                     emit({ op: "vtable_ptr", dst: vtablePtr, structName: node.value! });
                     emit({ op: "field_store", base: dst, offset: 0, src: vtablePtr });
                 }
 
-                // store each field
                 node.children.forEach(fieldNode => {
                     const offset = layout.get(fieldNode.value!);
                     if (offset === undefined) throw new Error(`Unknown field: ${fieldNode.value}`);
@@ -314,7 +298,6 @@ export function IRGen(ast: Node): IR[] {
                     emit({ op: "mov", dst: colsSlot, src: colsTemp });
                     const dst = fresh();
                     emit({ op: "array_new", dst, size: rowsSlot });
-                    // loop: for each row, allocate a column array
                     const loopIdx = fresh();
                     emit({ op: "const", dst: loopIdx, value: 0 });
                     const startLabel = freshLabel("arr2d_init");
@@ -419,8 +402,7 @@ export function IRGen(ast: Node): IR[] {
             }
 
             case "Binary": {
-                // short-circuit && / ||
-                // Uses alloc/store/load to create a stack slot both paths write to,
+                // alloc/store/load creates a stack slot both paths write to,
                 // so copy propagation cannot eliminate the writes.
                 if (node.value === "&&" || node.value === "||") {
                     const isAnd = node.value === "&&";
@@ -434,12 +416,10 @@ export function IRGen(ast: Node): IR[] {
                     } else {
                         emit({ op: "jnz", cond: lhsVal, target: labelShort });
                     }
-                    // lhs passed: evaluate rhs, store it
                     const rhsVal = genExpr(node.children[1]);
                     emit({ op: "store", addr: slot, src: rhsVal, type: "i64" });
                     emit({ op: "jmp", target: labelEnd });
                     emit({ op: "label", name: labelShort });
-                    // short-circuit path: store constant
                     const shortConst = fresh();
                     emit({ op: "const", dst: shortConst, value: isAnd ? 0 : 1 });
                     emit({ op: "store", addr: slot, src: shortConst, type: "i64" });
@@ -557,7 +537,6 @@ export function IRGen(ast: Node): IR[] {
             }
 
             case "CompoundAssign": {
-                // children[0] is an Identifier node, children[1] is the rhs
                 const name = node.children[0].value!;
                 const rhs = genExpr(node.children[1]);
                 const cur = fresh();
@@ -604,7 +583,6 @@ export function IRGen(ast: Node): IR[] {
             }
 
             case "Tuple": {
-                // Allocate a heap block: numFields * 8 bytes, store each element
                 const dst = fresh();
                 const n = node.children.length;
                 emit({ op: "alloc", dst, size: n * 8 });
@@ -624,14 +602,12 @@ export function IRGen(ast: Node): IR[] {
             }
 
             case "ArraySlice": {
-                // arr[start..end] — allocate new array of (end-start) elements, copy
                 const start = genExpr(node.children[0]);
                 const end = genExpr(node.children[1]);
                 const len = fresh();
                 const dst = fresh();
                 emit({ op: "sub", dst: len, a: end, b: start });
                 emit({ op: "array_new", dst, size: len });
-                // loop: for i = 0; i < len; i++
                 const i = fresh();
                 const startLabel = freshLabel("slice_loop");
                 const endLabel = freshLabel("slice_end");
@@ -812,8 +788,6 @@ export function IRGen(ast: Node): IR[] {
             }
 
             case "ForIn": {
-                // for varName in arrName { body }
-                // node.value = varName, node.children[0] = array expr, node.children[1] = body
                 const arrReg = genExpr(node.children[0]);
                 const arrSlot = `__forin_arr_${labelCount}`;
                 emit({ op: "mov", dst: arrSlot, src: arrReg });
@@ -830,12 +804,10 @@ export function IRGen(ast: Node): IR[] {
                 const cond = fresh();
                 emit({ op: "lt", dst: cond, a: idx, b: lenSlot });
                 emit({ op: "jz", cond, target: endLabel });
-                // bind loop variable
                 const elemDst = fresh();
                 emit({ op: "array_load", dst: elemDst, arr: arrSlot, index: idx });
                 emit({ op: "mov", dst: node.value!, src: elemDst });
                 genStmt(node.children[1]);
-                // increment
                 const nextIdx = fresh();
                 emit({ op: "add", dst: nextIdx, a: idx, b: "1" });
                 emit({ op: "mov", dst: idx, src: nextIdx });
@@ -846,9 +818,6 @@ export function IRGen(ast: Node): IR[] {
             }
 
             case "Match": {
-                // node.children[0] = subject expr, rest = MatchArm nodes
-                // MatchArm wildcard: value="_", children[0]=body
-                // MatchArm literal:  value=undefined, children[0]=pattern expr, children[1]=body
                 const subject = genExpr(node.children[0]);
                 const subjSlot = `__match_subj_${labelCount}`;
                 emit({ op: "mov", dst: subjSlot, src: subject });
@@ -857,11 +826,9 @@ export function IRGen(ast: Node): IR[] {
                 for (let i = 0; i < arms.length; i++) {
                     const arm = arms[i];
                     if (arm.value === "_") {
-                        // wildcard — always taken
                         genStmt(arm.children[0]);
                         emit({ op: "jmp", target: endLabel });
                     } else {
-                        // pattern is children[0], body is children[1]
                         const nextLabel = freshLabel("match_next");
                         const patDst = genExpr(arm.children[0]);
                         const cmpDst = fresh();
@@ -876,7 +843,6 @@ export function IRGen(ast: Node): IR[] {
                 break;
             }
 
-            // Bare expression statement (call with no assignment, etc.)
             default:
                 genExpr(node);
         }
@@ -890,13 +856,10 @@ export function IRGen(ast: Node): IR[] {
 
         emit({ op: "enter", name: node.value!, params });
 
-        // Clear named variable entries (params, locals) from prior functions.
-        // Temp names (t0, t1, ...) are globally unique so they stay.
         for (const v of [...floatTemps]) { if (!/^t\d+$/.test(v)) floatTemps.delete(v); }
         for (const v of [...stringVars]) { if (!/^t\d+$/.test(v)) stringVars.delete(v); }
         structTypeMap.clear();
 
-        // Materialise each param into a named register
         params.forEach((p, i) => {
             const paramNode = node.children[i];
             const isFloat = paramNode.varType === "float";
@@ -920,7 +883,6 @@ export function IRGen(ast: Node): IR[] {
         currentStructName = node.value!;
         const def = lookupStruct(node.value!)!;
 
-        // collect own methods
         const ownMethods = [
             ...node.children.filter(c => c.type === "StructMethod"),
             ...node.children
@@ -928,7 +890,6 @@ export function IRGen(ast: Node): IR[] {
                 .flatMap(o => o.children)
         ];
 
-        // emit method bodies
         ownMethods.forEach(method => {
             const mangledName = `${node.value!}.${method.value!}`;
             const params = method.children.filter(c => c.type === "Identifier").map(c => c.value!);
@@ -941,12 +902,10 @@ export function IRGen(ast: Node): IR[] {
             emit({ op: "leave" });
         });
 
-        // emit vtable if struct has any methods (including inherited)
         if (def.methods.size > 0) {
             const ownMethodNames = new Set(ownMethods.map(m => m.value!));
             emit({ op: "comment", text: `vtable for ${node.value}` });
 
-            // for each method in vtable order, point to own impl or inherited
             def.methods.forEach((_, methodName) => {
                 const hasOwn = ownMethodNames.has(methodName);
                 const implName = hasOwn ? `${node.value!}.${methodName}` : `${node.parent}.${methodName}`;

@@ -96,17 +96,32 @@ try {
 }
 
 const globalScope = createScope();
-define(globalScope, { name: "print",        kind: "func", params: 1 });
-define(globalScope, { name: "input",        kind: "func", params: 0 });
-define(globalScope, { name: "inputstr",     kind: "func", params: 0 });
-define(globalScope, { name: "len",          kind: "func", params: 1 });
-define(globalScope, { name: "printchar",    kind: "func", params: 1 });
-define(globalScope, { name: "strtoint",     kind: "func", params: 1 });
-define(globalScope, { name: "inttostr",     kind: "func", params: 1 });
-define(globalScope, { name: "print_string", kind: "func", params: 1 });
-define(globalScope, { name: "print_int",    kind: "func", params: 1 });
-define(globalScope, { name: "ord",          kind: "func", params: 1 });
-define(globalScope, { name: "chr",          kind: "func", params: 1 });
+define(globalScope, { name: "print",           kind: "func", params: 1 });
+define(globalScope, { name: "input",           kind: "func", params: 0 });
+define(globalScope, { name: "inputstr",        kind: "func", params: 0 });
+define(globalScope, { name: "len",             kind: "func", params: 1 });
+define(globalScope, { name: "printchar",       kind: "func", params: 1 });
+define(globalScope, { name: "strtoint",        kind: "func", params: 1 });
+define(globalScope, { name: "inttostr",        kind: "func", params: 1 });
+define(globalScope, { name: "print_string",    kind: "func", params: 1 });
+define(globalScope, { name: "print_int",       kind: "func", params: 1 });
+define(globalScope, { name: "ord",             kind: "func", params: 1 });
+define(globalScope, { name: "chr",             kind: "func", params: 1 });
+// C runtime graphics functions (graphics.o)
+define(globalScope, { name: "gfx_window_init",    kind: "func", params: 3 });
+define(globalScope, { name: "gfx_should_close",   kind: "func", params: 0 });
+define(globalScope, { name: "gfx_swap",           kind: "func", params: 0 });
+define(globalScope, { name: "gfx_destroy",        kind: "func", params: 0 });
+define(globalScope, { name: "gfx_key_down",       kind: "func", params: 1 });
+define(globalScope, { name: "gfx_time",           kind: "func", params: 0 });
+define(globalScope, { name: "gfx_log",            kind: "func", params: 1 });
+define(globalScope, { name: "gfx_c_clear",        kind: "func", params: 1 });
+define(globalScope, { name: "gfx_c_set_pixel",    kind: "func", params: 3 });
+define(globalScope, { name: "gfx_c_hline",        kind: "func", params: 4 });
+define(globalScope, { name: "gfx_c_vline",        kind: "func", params: 4 });
+define(globalScope, { name: "gfx_c_line",         kind: "func", params: 5 });
+define(globalScope, { name: "gfx_c_rect",         kind: "func", params: 5 });
+define(globalScope, { name: "gfx_c_rect_border",  kind: "func", params: 5 });
 
 try {
     declare(optimizedAst, globalScope);
@@ -187,7 +202,8 @@ try {
     die(`NASM error:\n${e.stderr?.toString() ?? e.message}`);
 }
 try {
-    chldproc.execSync(`gcc ${outputFile}.o -o ${outputFile} -no-pie`, { stdio: "pipe" });
+    const graphicsO = path.resolve(__dirname, "../Typescript/runtime/graphics.o");
+    chldproc.execSync(`gcc ${outputFile}.o ${graphicsO} -o ${outputFile} -no-pie -lglfw -lGL`, { stdio: "pipe" });
 } catch (e: any) {
     die(`Linker error:\n${e.stderr?.toString() ?? e.message}`);
 }

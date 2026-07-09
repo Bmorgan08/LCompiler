@@ -20,7 +20,6 @@ export function LexerWithPos(src: string): Token[] {
         if (c === "\n") { line++; col = 1; continue; }
         if (c === " " || c === "\t") { col++; continue; }
 
-        // line comment
         if (c === "/" && src[i + 1] === "/") {
             while (i < src.length && src[i] !== "\n") { i++; }
             line++; col = 1;
@@ -31,16 +30,14 @@ export function LexerWithPos(src: string): Token[] {
         const startCol = col;
 
         if (c === "a" && src.slice(i, i + 3) === "asm" && !/[a-zA-Z0-9_]/.test(src[i + 3] ?? "")) {
-            // asm { raw nasm } — capture raw content verbatim
             tokens.push({ value: "asm", line: startLine, col: startCol });
             col += 3; i += 2;
-            // skip whitespace to opening brace
             while (i + 1 < src.length && (src[i + 1] === " " || src[i + 1] === "\t" || src[i + 1] === "\n" || src[i + 1] === "\r")) {
                 if (src[i + 1] === "\n") { line++; col = 1; } else col++;
                 i++;
             }
             if (src[i + 1] !== "{") throw new Error(`${line}:${col}: expected '{' after asm`);
-            i++; col++; // eat {
+            i++; col++;
             tokens.push({ value: "{", line, col });
             let raw = "";
             let depth = 1;
@@ -61,19 +58,28 @@ export function LexerWithPos(src: string): Token[] {
             tokens.push({ value: id, line: startLine, col: startCol });
             col += id.length;
         } else if (/\d/.test(c)) {
-            let num = c;
-            while (i + 1 < src.length && /\d/.test(src[i + 1])) {
-                num += src[++i];
-            }
-            // float: digits.digits
-            if (i + 1 < src.length && src[i + 1] === "." && i + 2 < src.length && /\d/.test(src[i + 2])) {
-                num += src[++i]; // .
+            if (c === "0" && (src[i + 1] === "x" || src[i + 1] === "X")) {
+                let hex = "0x";
+                i += 2; col += 2;
+                while (i < src.length && /[0-9a-fA-F]/.test(src[i])) {
+                    hex += src[i++]; col++;
+                }
+                i--;
+                tokens.push({ value: String(parseInt(hex, 16)), line: startLine, col: startCol });
+            } else {
+                let num = c;
                 while (i + 1 < src.length && /\d/.test(src[i + 1])) {
                     num += src[++i];
                 }
+                if (i + 1 < src.length && src[i + 1] === "." && i + 2 < src.length && /\d/.test(src[i + 2])) {
+                    num += src[++i];
+                    while (i + 1 < src.length && /\d/.test(src[i + 1])) {
+                        num += src[++i];
+                    }
+                }
+                tokens.push({ value: num, line: startLine, col: startCol });
+                col += num.length;
             }
-            tokens.push({ value: num, line: startLine, col: startCol });
-            col += num.length;
         } else if ((c === "&" && src[i + 1] === "&") || (c === "|" && src[i + 1] === "|")) {
             tokens.push({ value: c + src[i + 1], line: startLine, col: startCol });
             i++; col += 2;
@@ -99,7 +105,6 @@ export function LexerWithPos(src: string): Token[] {
             tokens.push({ value: "..", line: startLine, col: startCol });
             i++; col += 2;
         } else if (c === "'" && i + 2 < src.length && src[i + 2] === "'") {
-            // char literal 'x'
             tokens.push({ value: `'${src[i + 1]}'`, line: startLine, col: startCol });
             i += 2; col += 3;
         } else if (c === '"') {

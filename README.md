@@ -21,7 +21,7 @@ main() {
 - Structs with methods and single inheritance
 - For-in loops, match expressions, short-circuit `&&`/`||`
 - Inline assembly via `asm { }`
-- Standard library (`math`, trig, string conversion)
+- Standard library (`math`, trig, string conversion, graphics)
 - VS Code extension with syntax highlighting and language server
 
 ## Requirements
@@ -49,13 +49,13 @@ node dist/Main.js hello.l           # compiles to ./output
 node dist/Main.js hello.l hello     # compiles to ./hello
 ```
 
-| Flag        | Description                             |
-|-------------|-----------------------------------------|
-| `--ir`      | Print the intermediate representation   |
-| `--ast`     | Print the abstract syntax tree          |
-| `--asm`     | Print the generated assembly            |
-| `--tokens`  | Print the token stream                  |
-| `--verbose` | Print all of the above                  |
+| Flag        | Description                           |
+| ----------- | ------------------------------------- |
+| `--ir`      | Print the intermediate representation |
+| `--ast`     | Print the abstract syntax tree        |
+| `--asm`     | Print the generated assembly          |
+| `--tokens`  | Print the token stream                |
+| `--verbose` | Print all of the above                |
 
 ## Language Reference
 

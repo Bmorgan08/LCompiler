@@ -105,7 +105,6 @@ export function copyProp(IR: IR[]): IR[] {
         while (typeof v === "string" && env.has(v)) {
             const next = env.get(v);
 
-            // only propagate safe primitives
             if (typeof next === "string" || typeof next === "number") {
                 v = next;
             } else {
@@ -119,9 +118,6 @@ export function copyProp(IR: IR[]): IR[] {
 
     for (const instr of IR) {
 
-        // =========================
-        // DO NOT propagate across control flow blindly
-        // =========================
         if (instr.op === "jmp" || instr.op === "label") {
             env.clear();
             out.push(instr);
@@ -135,7 +131,6 @@ export function copyProp(IR: IR[]): IR[] {
             continue;
         }
 
-        // In copyProp, change the array op handling:
         if (
             instr.op === "array_new" ||
             instr.op === "array_store" ||
@@ -145,7 +140,6 @@ export function copyProp(IR: IR[]): IR[] {
             const resolved: any = { ...instr };
             if (instr.op === "array_load") {
                 resolved.index = String(resolve((instr as any).index));
-                // kill only the dst so subsequent instructions don't use stale value
                 env.delete((instr as any).dst);
             }
             if (instr.op === "array_store") {
@@ -159,14 +153,10 @@ export function copyProp(IR: IR[]): IR[] {
                 if (instr.op === "array_len") {
                 env.delete((instr as any).dst);
             }
-            // NO env.clear() — only kill the dst, preserve aliases for subsequent instructions
             out.push(resolved);
             continue;
         }       
 
-        // =========================
-        // rewrite operands safely
-        // =========================
         const copy: any = { ...instr };
 
         for (const key in copy) {
@@ -177,7 +167,6 @@ export function copyProp(IR: IR[]): IR[] {
         if (instr.op === "call") {
             copy.args = (instr as any).args.map((arg: string) => {
                 let resolved = arg;
-                // keep resolving until we hit a named variable (not a temp)
                 while (env.has(resolved)) {
                     const next = env.get(resolved) as string;
                     if (/^t\d+$/.test(next)) {
@@ -191,9 +180,6 @@ export function copyProp(IR: IR[]): IR[] {
             });
         }
 
-        // =========================
-        // mov handling
-        // =========================
         if (instr.op === "mov") {
             const resolved = resolve(instr.src);
             if (stringTemps.has(instr.src) || typeof resolved === "string" && stringTemps.has(resolved)) {
@@ -216,9 +202,6 @@ export function copyProp(IR: IR[]): IR[] {
             continue;
         }
 
-        // =========================
-        // kill on reassignment (IMPORTANT)
-        // =========================
         if ("dst" in instr) {
             env.delete((instr as any).dst);
         }       
@@ -262,15 +245,12 @@ export function insertFrees(ir: IR[]): IR[] {
             for (let k = 0; k < fnInstrs.length; k++) {
                 const cur = fnInstrs[k];
                 if (cur.op === "label" && cur.name.startsWith("arr2d_end")) {
-                    // Owner is the mov immediately after this label
                     const movInstr = fnInstrs[k + 1];
                     if (!movInstr || movInstr.op !== "mov") continue;
                     const owner = (movInstr as any).dst as string;
-                    // Scan backwards for the nearest arr2d_init label
                     for (let m = k - 1; m >= 0; m--) {
                         const prev = fnInstrs[m];
                         if (prev.op === "label" && prev.name.startsWith("arr2d_init")) {
-                            // The outer array_new is just before this init label
                             for (let n = m - 1; n >= 0; n--) {
                                 if (fnInstrs[n].op === "array_new") {
                                     const rowCount = String((fnInstrs[n] as any).size);
@@ -316,7 +296,6 @@ export function insertFrees(ir: IR[]): IR[] {
                 }
             }
 
-            // Only the final owners remain in varScope
             const allHeapVars = new Set(varScope.keys());
 
             // Build forward mov chain: src -> final owner (to resolve ret value through movs)
@@ -330,12 +309,17 @@ export function insertFrees(ir: IR[]): IR[] {
                 return cur;
             }
 
-            // Now emit instructions, inserting frees at the right points.
             let loopDepth = 0;
             const loopLabelStack: string[] = [];
             const freedVars = new Set<string>();
+            // Track which heap vars have been allocated so far (in linear order).
+            // Only free vars that have been seen before the ret on this path.
+            const allocatedSoFar = new Set<string>();
 
             for (const fi of fnInstrs) {
+                const allocDst = isHeapAlloc(fi);
+                if (allocDst && allHeapVars.has(allocDst)) allocatedSoFar.add(allocDst);
+
                 if (fi.op === "label" && fi.name.startsWith("while_start")) {
                     loopDepth++;
                     loopLabelStack.push(fi.name);
@@ -343,7 +327,6 @@ export function insertFrees(ir: IR[]): IR[] {
                     continue;
                 }
 
-                // Before the back-edge jmp, free all vars owned by this loop depth
                 if (fi.op === "jmp" && loopLabelStack.length > 0 && fi.target === loopLabelStack[loopLabelStack.length - 1]) {
                     for (const [v, d] of varScope) {
                         if (d === loopDepth && !freedVars.has(v)) {
@@ -363,10 +346,9 @@ export function insertFrees(ir: IR[]): IR[] {
 
                 if (fi.op === "ret") {
                     const returnedVal = fi.value;
-                    // resolve the returned temp through mov chain to find the owning var
                     const returnedOwner = returnedVal ? resolveOwner(returnedVal) : undefined;
                     for (const v of allHeapVars) {
-                        if (!freedVars.has(v) && v !== returnedOwner) {
+                        if (!freedVars.has(v) && v !== returnedOwner && allocatedSoFar.has(v)) {
                             if (array2dRows.has(v)) {
                                 result.push({ op: "array_free_2d", arr: v, rows: array2dRows.get(v)! });
                             } else {

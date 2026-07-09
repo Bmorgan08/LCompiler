@@ -123,8 +123,6 @@ export function declare(node: Node, scope: Scope) {
             break;
 
         case "ForIn": {
-            // Declare the loop variable in the body scope
-            // We just recurse into the body block — VarDecl for loop var handled in validate
             if (node.children[1] && node.children[1].type === "Block") {
                 const forInScope = createScope(scope);
                 define(forInScope, { name: node.value!, kind: "var", type: "int" });
@@ -134,12 +132,10 @@ export function declare(node: Node, scope: Scope) {
         }
 
         case "Match":
-            // recurse into arm bodies
             node.children.slice(1).forEach(arm => {
                 if (arm.value === "_") {
                     if (arm.children[0]) declare(arm.children[0], scope);
                 } else {
-                    // children[1] is the body
                     if (arm.children[1]) declare(arm.children[1], scope);
                 }
             });

@@ -22,8 +22,9 @@ L is a compiled, statically-typed language that produces native Linux binaries. 
 14. [Inline Assembly](#inline-assembly)
 15. [Built-ins](#built-ins)
 16. [Standard Library](#standard-library)
-17. [Full Example](#full-example)
-18. [Nerd Talk](#nerd-talk)
+17. [Graphics](#graphics)
+18. [Full Example](#full-example)
+19. [Nerd Talk](#nerd-talk)
 
 ---
 
@@ -114,6 +115,13 @@ var f = 1.5;       // inferred as float
 ```
 
 `let` and `const` are accepted as aliases for `var` — the language does not enforce immutability on `const` variables yet.
+
+Integer literals can be written in hexadecimal with a `0x` prefix:
+
+```
+var int red   = 0xFF0000;
+var int flags = 0x1F;
+```
 
 ---
 
@@ -546,6 +554,69 @@ Useful constants:
 ```
 var float pi  = 3.1415926536;
 var float tau = 6.2831853072;   // 2 * pi
+```
+
+---
+
+## Graphics
+
+Import with `import graphics;`. Opens an OpenGL window and lets you draw with pixel-coordinate functions — `(0, 0)` is the top-left corner, x grows right, y grows down. Colors are `0xRRGGBB` integers; hex literals are supported directly.
+
+### Setup and Loop
+
+```
+import graphics;
+
+main() {
+    gfx_init(800, 600);         // open an 800×600 window
+
+    while (!gfx_closed()) {
+        gfx_clear(0x0a0a1a);    // fill background
+
+        // ... draw here ...
+
+        gfx_present();          // swap buffers and poll events
+    }
+
+    gfx_destroy_window();
+    return 0;
+}
+```
+
+### Drawing Functions
+
+| Function                                      | Description                          |
+|-----------------------------------------------|--------------------------------------|
+| `gfx_clear(int color)`                        | Fill the entire screen               |
+| `gfx_set_pixel(int x, int y, int color)`      | Draw a single pixel                  |
+| `gfx_hline(int x, int y, int len, int color)` | Horizontal line                      |
+| `gfx_vline(int x, int y, int len, int color)` | Vertical line                        |
+| `gfx_line(int x0, int y0, int x1, int y1, int color)` | Line between two points     |
+| `gfx_rect(int x, int y, int w, int h, int color)`     | Filled rectangle            |
+| `gfx_rect_border(int x, int y, int w, int h, int color)` | Unfilled rectangle border |
+
+### Input and Timing
+
+| Function                  | Description                                      |
+|---------------------------|--------------------------------------------------|
+| `gfx_closed()`            | Returns `1` when the window has been closed      |
+| `gfx_key(int key)`        | Returns `1` while the given key is held down     |
+| `gfx_get_time()`          | Seconds elapsed since `gfx_init` was called      |
+
+Key constants are provided as globals: `KEY_SPACE`, `KEY_ESCAPE`, `KEY_ENTER`, `KEY_W`, `KEY_A`, `KEY_S`, `KEY_D`, `KEY_UP`, `KEY_DOWN`, `KEY_LEFT`, `KEY_RIGHT`, `KEY_SHIFT`.
+
+### Globals
+
+`WIDTH` and `HEIGHT` are set by `gfx_init` and reflect the window dimensions.
+
+### Colors
+
+Colors are packed `0xRRGGBB` integers:
+
+```
+gfx_rect(10, 10, 100, 50, 0xFF0000);   // red
+gfx_rect(10, 70, 100, 50, 0x00FF00);   // green
+gfx_rect(10, 130, 100, 50, 0x0000FF);  // blue
 ```
 
 ---
