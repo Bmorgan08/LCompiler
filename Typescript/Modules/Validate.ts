@@ -254,6 +254,8 @@ export function validate(node: Node, scope: Scope) {
             let structType: string | undefined
             if(node.children[0].type === "StructInstantiate") {
                 structType = node.children[0].value
+            } else if (node.varType && /^[A-Z]/.test(node.varType)) {
+                structType = node.varType   // e.g. 'var Point p = makePoint();'
             }
             if (!resolve(node.value!, scope)) {
                 define(scope, {
@@ -330,12 +332,15 @@ export function validate(node: Node, scope: Scope) {
             const sym = resolve(node.value!, scope);
             if (!sym) err(node, `Undefined variable: ${node.value}`);
             validate(node.children[0], scope);
+            // the array may now have a different size; leave later indexes to the runtime check
+            sym.size = undefined;
             const inferredType = inferType(node.children[0], scope);
             const compatibleAssign = (declared: string, inferred: string) =>
                 (declared === "int" && inferred === "bool") ||
                 (declared === "int" && inferred === "float") ||
                 (declared === "float" && inferred === "int");
-            if (sym.type && sym.type !== inferredType && inferredType !== "unknown"
+            // "unknown" on either side (e.g. a variable initialised from a call) is not checked
+            if (sym.type && sym.type !== "unknown" && sym.type !== inferredType && inferredType !== "unknown"
                 && !compatibleAssign(sym.type, inferredType)) {
                 err(node, `Type mismatch in assignment to ${node.value}: ${sym.type} vs ${inferredType}`);
             }
@@ -357,7 +362,7 @@ export function validate(node: Node, scope: Scope) {
             if (node.children[0].type === "Number") {
                 const idx = Number(node.children[0].value);
                 if (idx < 0) err(node.children[0], `Array index out of bounds: negative index ${idx} for '${node.value}'`);
-                if (sym.size !== undefined && idx > sym.size) {
+                if (sym.size !== undefined && idx >= sym.size) {
                     err(node.children[0], `Array index out of bounds: index ${idx} >= size ${sym.size} for '${node.value}'`);
                 }
             }

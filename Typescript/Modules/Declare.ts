@@ -118,7 +118,8 @@ export function declare(node: Node, scope: Scope) {
                 name: node.value!,
                 kind: "var",
                 type: node.varType ?? "unknown",
-                structType: node.children[0].type === "StructInstantiate" ? node.children[0].value : undefined
+                structType: node.children[0].type === "StructInstantiate" ? node.children[0].value
+                    : node.varType && /^[A-Z]/.test(node.varType) ? node.varType : undefined
             });
             break;
 

@@ -10,15 +10,27 @@ export function fold(node: Node): Node {
             if (left.type === "Number" && right.type === "Number") {
                 const l = parseFloat(left.value! as string);
                 const r = parseFloat(right.value! as string);
+
+                if (["+", "-", "*", "/"].includes(node.value!)) {
+                    // a float operand makes a float result
+                    if (left.varType === "float" || right.varType === "float") {
+                        const f = node.value === "+" ? l + r : node.value === "-" ? l - r : node.value === "*" ? l * r : l / r;
+                        return { type: "Number", value: f.toString(), varType: "float", children: [] };
+                    }
+                    // ints: 64-bit wrapping arithmetic, and '/' truncates towards zero like idiv
+                    if (/^-?\d+$/.test(left.value!) && /^-?\d+$/.test(right.value!)) {
+                        const a = BigInt(left.value!);
+                        const b = BigInt(right.value!);
+                        if (node.value === "/" && b === 0n) {
+                            return { ...node, children: [left, right] };   // leave it to fail at runtime
+                        }
+                        const n = node.value === "+" ? a + b : node.value === "-" ? a - b : node.value === "*" ? a * b : a / b;
+                        return { type: "Number", value: BigInt.asIntN(64, n).toString(), children: [] };
+                    }
+                    return { ...node, children: [left, right] };
+                }
+
                 switch (node.value) {
-                    case "+":
-                        return { type: "Number", value: (l + r).toString(), children: [] };
-                    case "-":
-                        return { type: "Number", value: (l - r).toString(), children: [] };
-                    case "*":
-                        return { type: "Number", value: (l * r).toString(), children: [] };
-                    case "/":
-                        return { type: "Number", value: (l / r).toString(), children: [] };
                     case "==":
                         return { type: "Number", value: (l === r ? "1" : "0"), varType: "bool", children: [] };
                     case "!=":
@@ -72,7 +84,7 @@ export function DCE(node: Node): Node{
                 if (Number(condition.value) !== 0) {
                     return DCE(node.children[1]) ?? node.children[1]; // fold if(true) { ... }
                 } else {
-                    return DCE(node.children[2]) ? DCE(node.children[2]): { type: "Block", children: [] }; // fold if(false) { ... } else { ... }
+                    return node.children[2] ? DCE(node.children[2]) : { type: "Block", children: [] }; // fold if(false) { ... } else { ... }
                 }
             }
             return { ...node, children: node.children.map(DCE) }
@@ -98,6 +110,16 @@ export function copyProp(IR: IR[]): IR[] {
         [...assignCount.entries()].filter(([, n]) => n > 1).map(([k]) => k)
     );
 
+    // Globals are the named variables written before the first function (the same
+    // rule the emitter uses). Any call may change them, so their values are never
+    // recorded in the environment.
+    const globals = new Set<string>();
+    for (const instr of IR) {
+        if (instr.op === "enter") break;
+        const dst = (instr as any).dst;
+        if (typeof dst === "string" && !/^(t\d+|__lit_.*)$/.test(dst)) globals.add(dst);
+    }
+
     const env = new Map<string, string | number>();
     const stringTemps = new Set<string>();
 
@@ -114,11 +136,40 @@ export function copyProp(IR: IR[]): IR[] {
         return v;
     }
 
+    // index of the last instruction that reads each name
+    const lastUse = new Map<string, number>();
+    const nonOperands = new Set(["op", "dst", "name", "target", "fn", "structName", "methodName", "implName", "text", "type"]);
+    IR.forEach((instr, idx) => {
+        for (const [key, val] of Object.entries(instr)) {
+            if (nonOperands.has(key)) continue;
+            if (typeof val === "string") lastUse.set(val, idx);
+            else if (Array.isArray(val)) val.forEach(v => { if (typeof v === "string") lastUse.set(v, idx); });
+        }
+    });
+
     const out: IR[] = [];
+    const elided = new Set<string>();   // temps whose defining mov was dropped
+    let pos = 0;                        // index of the instruction being processed
 
-    for (const instr of IR) {
+    // Called before `name` is redefined. Anything recorded as a copy of it must
+    // stop resolving to it; a dropped temp that is still read later is written
+    // out first so it keeps the value it was meant to copy.
+    function killAliases(name: string) {
+        for (const [k, v] of [...env]) {
+            if (v !== name) continue;
+            if (elided.has(k) && (lastUse.get(k) ?? -1) > pos) {
+                out.push({ op: "mov", dst: k, src: name });
+                elided.delete(k);
+            }
+            env.delete(k);
+        }
+    }
 
-        if (instr.op === "jmp" || instr.op === "label") {
+    for (const [idx, instr] of IR.entries()) {
+        pos = idx;
+
+        // functions share nothing, and control flow merges at labels
+        if (instr.op === "jmp" || instr.op === "label" || instr.op === "enter") {
             env.clear();
             out.push(instr);
             continue;
@@ -138,6 +189,7 @@ export function copyProp(IR: IR[]): IR[] {
             instr.op === "array_len"
         ) {
             const resolved: any = { ...instr };
+            if ("dst" in instr) killAliases((instr as any).dst);
             if (instr.op === "array_load") {
                 resolved.index = String(resolve((instr as any).index));
                 env.delete((instr as any).dst);
@@ -178,6 +230,8 @@ export function copyProp(IR: IR[]): IR[] {
                 }
                 return resolved;
             });
+            // the callee may change any global
+            for (const g of globals) killAliases(g);
         }
 
         if (instr.op === "mov") {
@@ -188,6 +242,15 @@ export function copyProp(IR: IR[]): IR[] {
     
             if (/^t\d+$/.test(instr.dst) && !multiAssigned.has(instr.dst)) {
                 env.set(instr.dst, instr.src);
+                elided.add(instr.dst);
+                continue;
+            }
+
+            killAliases(instr.dst);
+
+            if (globals.has(instr.dst)) {
+                env.delete(instr.dst);
+                out.push({ ...copy, src: String(resolved) });
                 continue;
             }
 
@@ -197,12 +260,15 @@ export function copyProp(IR: IR[]): IR[] {
         }
 
         if (instr.op === "const") {
-            env.set(instr.dst, instr.value);
+            killAliases(instr.dst);
+            // a bigint is kept as its decimal text, which later stages treat as a literal
+            env.set(instr.dst, typeof instr.value === "bigint" ? instr.value.toString() : instr.value);
             out.push(instr);
             continue;
         }
 
         if ("dst" in instr) {
+            killAliases((instr as any).dst);
             env.delete((instr as any).dst);
         }       
 
@@ -215,6 +281,15 @@ export function copyProp(IR: IR[]): IR[] {
 export function insertFrees(ir: IR[]): IR[] {
     const result: IR[] = [];
     let i = 0;
+
+    // globals (named variables written before the first function) outlive every
+    // function, so a heap value moved into one is never freed here
+    const globals = new Set<string>();
+    for (const instr of ir) {
+        if (instr.op === "enter") break;
+        const dst = (instr as any).dst;
+        if (typeof dst === "string" && !/^(t\d+|__lit_.*)$/.test(dst)) globals.add(dst);
+    }
 
     while (i < ir.length) {
         const instr = ir[i];
@@ -267,7 +342,11 @@ export function insertFrees(ir: IR[]): IR[] {
 
             // Build a map: var -> scope depth that owns it.
             // ownership transfer via mov removes src, so only the final owner is freed.
+            // A named variable is owned at the depth it was declared at (its decl mov,
+            // or its first assignment), not where it was last assigned: a variable
+            // declared before a loop and reassigned inside it must survive the loop.
             const varScope = new Map<string, number>();
+            const declDepth = new Map<string, number>();
             {
                 let depth = 0;
                 const depthStack: string[] = [];
@@ -282,11 +361,18 @@ export function insertFrees(ir: IR[]): IR[] {
                     }
                     const dst = isHeapAlloc(fi);
                     if (dst) varScope.set(dst, depth);
+                    if (fi.op === "arg") declDepth.set(fi.dst, depth);
+                    if (fi.op === "mov" && !/^t\d+$/.test(fi.dst) && (fi.decl || !declDepth.has(fi.dst))) {
+                        declDepth.set(fi.dst, depth);
+                    }
                     if (fi.op === "mov") {
                         const srcDepth = varScope.get(fi.src);
                         if (srcDepth !== undefined) {
                             varScope.delete(fi.src); // src no longer owns the allocation
-                            varScope.set(fi.dst, srcDepth);
+                            if (!globals.has(fi.dst)) {
+                                const ownerDepth = /^t\d+$/.test(fi.dst) ? srcDepth : (declDepth.get(fi.dst) ?? srcDepth);
+                                varScope.set(fi.dst, ownerDepth);
+                            }
                         }
                     }
                     // array_store transfers ownership of src into the array — don't free src separately
@@ -320,6 +406,15 @@ export function insertFrees(ir: IR[]): IR[] {
                 const allocDst = isHeapAlloc(fi);
                 if (allocDst && allHeapVars.has(allocDst)) allocatedSoFar.add(allocDst);
 
+                // The frees below are placed by position, not by path, so a variable can
+                // be freed on a path where it was never allocated. Start every heap owner
+                // as NULL (before the args are read) so that is a free(NULL) no-op.
+                if (fi.op === "enter") {
+                    result.push(fi);
+                    for (const v of allHeapVars) result.push({ op: "const", dst: v, value: 0 });
+                    continue;
+                }
+
                 if (fi.op === "label" && fi.name.startsWith("while_start")) {
                     loopDepth++;
                     loopLabelStack.push(fi.name);
@@ -335,6 +430,8 @@ export function insertFrees(ir: IR[]): IR[] {
                             } else {
                                 result.push({ op: "free", addr: v });
                             }
+                            // an iteration that skips the allocation must not free it again
+                            result.push({ op: "const", dst: v, value: 0 });
                             freedVars.add(v);
                         }
                     }

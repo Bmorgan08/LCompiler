@@ -117,13 +117,27 @@ function math_tan(float x) {
 
 function math_sqrt(float x) {
     if (x <= 0.0) { return 0.0; }
+    // bring x into [1, 4) so the iterations start near the root:
+    // sqrt(x * 4^k) = sqrt(x) * 2^k, and scaling by 4 is exact
+    var float scale = 1.0;
+    var int k = 0;
+    while (x >= 4.0 && k < 1100) {
+        x = x / 4.0;
+        scale = scale * 2.0;
+        k++;
+    }
+    while (x < 1.0 && k < 1100) {
+        x = x * 4.0;
+        scale = scale / 2.0;
+        k++;
+    }
     var float guess = x / 2.0;
     var int i = 0;
     while (i < 20) {
         guess = (guess + x / guess) / 2.0;
         i++;
     }
-    return guess;
+    return guess * scale;
 }
 
 function math_ln(float x) {
@@ -132,6 +146,10 @@ function math_ln(float x) {
     while (x >= 2.0) {
         x = x / 2.0;
         n++;
+    }
+    while (x < 1.0) {
+        x = x * 2.0;
+        n--;
     }
     var float u = (x - 1.0) / (x + 1.0);
     var float u2 = u * u;

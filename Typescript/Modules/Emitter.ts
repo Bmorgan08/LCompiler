@@ -3,8 +3,8 @@ import { IR } from "./IR";
 export function emitNASM(instructions: IR[]): string {
     const nasmLines: string[] = [
         "section .data",
-        "fmt db '%d', 10, 0",
-        "fmt_in db '%d', 0",
+        "fmt db '%ld', 10, 0",
+        "fmt_in db '%ld', 0",
         "fmt_str db '%s', 10, 0",
         "fmt_str_in db '%255s', 0",
         "fmt_char db '%c', 0",
@@ -15,6 +15,7 @@ export function emitNASM(instructions: IR[]): string {
         "extern printf",
         "extern scanf",
         "extern malloc",
+        "extern calloc",
         "extern strcpy",
         "extern strcat",
         "extern strlen",
@@ -41,6 +42,10 @@ export function emitNASM(instructions: IR[]): string {
     // Identify global variables: instructions emitted before the first function enter.
     // Collect their names so we can store them in .bss and access them RIP-relative.
     const globalVars = new Set<string>();
+    // Globals holding strings or floats. Their initialisers run inside main, which
+    // may be emitted after functions that use them, so work this out up front.
+    const globalStrings = new Set<string>();
+    const globalFloats = new Set<string>();
     {
         const firstEnterIdx = instructions.findIndex(i => i.op === "enter");
         if (firstEnterIdx > 0) {
@@ -51,6 +56,30 @@ export function emitNASM(instructions: IR[]): string {
                 }
             }
             const globalInits = instructions.splice(0, firstEnterIdx);
+            const strs = new Set<string>();
+            const floats = new Set<string>();
+            for (const instr of globalInits) {
+                const i = instr as any;
+                if (!i.dst) continue;
+                if (instr.op === "string_const" || instr.op === "str_concat" ||
+                    (instr.op === "const" && typeof instr.value === "string") ||
+                    (instr.op === "field_load" && instr.is_string) ||
+                    (instr.op === "call" && (instr.returns_string || instr.fn === "inttostr" || instr.fn === "inputstr"))) {
+                    strs.add(i.dst);
+                }
+                if (["fconst", "fadd", "fsub", "fmul", "fdiv", "fneg", "itof"].includes(instr.op) ||
+                    (instr.op === "call" && instr.returns_float)) {
+                    floats.add(i.dst);
+                }
+                if (instr.op === "mov") {
+                    if (strs.has(instr.src)) strs.add(instr.dst);
+                    if (floats.has(instr.src)) floats.add(instr.dst);
+                }
+            }
+            for (const g of globalVars) {
+                if (strs.has(g)) globalStrings.add(g);
+                if (floats.has(g)) globalFloats.add(g);
+            }
             const mainEnterIdx = instructions.findIndex(i => i.op === "enter" && (i as any).name === "main");
             const insertAfter = mainEnterIdx >= 0 ? mainEnterIdx + 1 : 1;
             instructions.splice(insertAfter, 0, ...globalInits);
@@ -60,7 +89,7 @@ export function emitNASM(instructions: IR[]): string {
     let stackMap = new Map<string, number>();
     let stackOffset = 0;
     const stringLiterals = new Map<string, string>();
-    const stringTemps = new Set<string>();
+    const stringTemps = new Set<string>(globalStrings);
     let stringCount = 0;
     const floatVars = new Set<string>();
     const floatConsts: string[] = [];
@@ -104,6 +133,7 @@ export function emitNASM(instructions: IR[]): string {
                 frameSizes.set(fnName, aligned);
             } else {
                 simOperands(instr);
+                if (instr.op === "str_concat") simSlot("__concat_len");
                 if (instr.op === "array_free_2d") {
                     simSlot(`__free2d_idx_${instr.arr}`);
                     if (typeof instr.rows === "string" && !/^-?\d+$/.test(instr.rows)) simSlot(instr.rows);
@@ -145,10 +175,43 @@ export function emitNASM(instructions: IR[]): string {
         return `[rbp - ${getSlot(name)}]`;
     }
 
+    // Store an integer constant to memory. 'mov qword [mem], imm' only encodes a
+    // sign-extended 32-bit immediate, so larger values go through a register.
+    // `scratch` must not hold anything the caller still needs.
+    function storeImm(dest: string, value: string | number | bigint, scratch = "rax") {
+        const text = String(value);
+        if (/^-?\d+$/.test(text) && (BigInt(text) < -2147483648n || BigInt(text) > 2147483647n)) {
+            nasmLines.push(`mov ${scratch}, ${text}`);
+            nasmLines.push(`mov ${dest}, ${scratch}`);
+        } else {
+            nasmLines.push(`mov qword ${dest}, ${text}`);
+        }
+    }
+
+    // Array index as a mov source: the literal itself, or the variable's memory.
+    function indexOperand(index: string): string {
+        return /^-?\d+$/.test(index) ? index : memRef(index);
+    }
+
+    // True when a literal index's byte offset fits in a 32-bit displacement.
+    function fitsDisp32(index: string): boolean {
+        const offset = 8n + BigInt(index) * 8n;
+        return offset >= -2147483648n && offset <= 2147483647n;
+    }
+
+    // Jump to _bounds_fail unless 0 <= index < length. Expects rcx = length; clobbers rdx.
+    function boundsCheck(index: string) {
+        nasmLines.push(`mov rdx, ${indexOperand(index)}`);
+        nasmLines.push(`cmp rdx, rcx`);
+        nasmLines.push(`jge _bounds_fail`);
+        nasmLines.push(`cmp rdx, 0`);
+        nasmLines.push(`jl _bounds_fail`);
+    }
+
     function loadOperand(val: string): string {
         if (/^-?\d+$/.test(val)) {
             const slot = getSlot(`__lit_${val}`);
-            nasmLines.push(`mov qword [rbp - ${slot}], ${val}`);
+            storeImm(`[rbp - ${slot}]`, val);
             return slot.toString();
         }
         if (globalVars.has(val)) {
@@ -165,9 +228,13 @@ export function emitNASM(instructions: IR[]): string {
         stackMap = new Map();
         stackOffset = 0;
         floatVars.clear();
+        for (const g of globalFloats) floatVars.add(g);
     }
 
     const sysv = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+    // SysV numbers int and float argument registers separately
+    let intArgIdx = 0;
+    let floatArgIdx = 0;
 
     for (const instr of instructions) {
         switch (instr.op) {
@@ -181,11 +248,14 @@ export function emitNASM(instructions: IR[]): string {
                     nasmLines.push(`add rax, 8`);
                     nasmLines.push(`mov rdi, rax`);
                 }
-                nasmLines.push(`call malloc`);
+                // calloc(1, bytes): new arrays are zero-initialised
+                nasmLines.push(`mov rsi, rdi`);
+                nasmLines.push(`mov rdi, 1`);
+                nasmLines.push(`call calloc`);
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 if (typeof instr.size === "number") {
                     nasmLines.push(`mov rax, ${memRef(instr.dst)}`);
-                    nasmLines.push(`mov qword [rax], ${instr.size}`);
+                    storeImm(`[rax]`, instr.size, "rcx");
                 } else {
                     nasmLines.push(`mov rax, ${memRef(instr.dst)}`);
                     nasmLines.push(`mov rcx, ${memRef(instr.size)}`);
@@ -198,22 +268,13 @@ export function emitNASM(instructions: IR[]): string {
                 nasmLines.push(`mov rax, ${memRef(instr.arr)}`);  // rax = ptr
 
                 nasmLines.push(`mov rcx, [rax]`);                // rcx = length
-                if (/^-?\d+$/.test(instr.index)) {
-                    nasmLines.push(`cmp rcx, ${instr.index}`);
-                    nasmLines.push(`jle _bounds_fail`);
-                } else {
-                    nasmLines.push(`mov rdx, ${memRef(instr.index)}`);
-                    nasmLines.push(`cmp rdx, rcx`);
-                    nasmLines.push(`jge _bounds_fail`);
-                    nasmLines.push(`cmp rdx, 0`);
-                    nasmLines.push(`jl _bounds_fail`);
-                }
+                boundsCheck(instr.index);
 
-                if (/^-?\d+$/.test(instr.index)) {
+                if (/^-?\d+$/.test(instr.index) && fitsDisp32(instr.index)) {
                     const offset = 8 + Number(instr.index) * 8;
                     nasmLines.push(`mov rax, [rax + ${offset}]`);
                 } else {
-                    nasmLines.push(`mov rdx, ${memRef(instr.index)}`);
+                    nasmLines.push(`mov rdx, ${indexOperand(instr.index)}`);
                     nasmLines.push(`imul rdx, 8`);
                     nasmLines.push(`add rdx, 8`);
                     nasmLines.push(`mov rax, [rax + rdx]`);
@@ -226,16 +287,7 @@ export function emitNASM(instructions: IR[]): string {
                 nasmLines.push(`mov rax, ${memRef(instr.arr)}`);  // rax = ptr
 
                 nasmLines.push(`mov rcx, [rax]`);                // rcx = length
-                if (/^-?\d+$/.test(instr.index)) {
-                    nasmLines.push(`cmp rcx, ${instr.index}`);
-                    nasmLines.push(`jle _bounds_fail`);
-                } else {
-                    nasmLines.push(`mov rdx, ${memRef(instr.index)}`);
-                    nasmLines.push(`cmp rdx, rcx`);
-                    nasmLines.push(`jge _bounds_fail`);
-                    nasmLines.push(`cmp rdx, 0`);
-                    nasmLines.push(`jl _bounds_fail`);
-                }
+                boundsCheck(instr.index);
 
                 if(/^-?\d+$/.test(instr.src)) {
                     nasmLines.push(`mov r10, ${instr.src}`)
@@ -243,11 +295,11 @@ export function emitNASM(instructions: IR[]): string {
                     nasmLines.push(`mov r10, ${memRef(instr.src)}`)
                 }
 
-                if (/^-?\d+$/.test(instr.index)) {
+                if (/^-?\d+$/.test(instr.index) && fitsDisp32(instr.index)) {
                     const offset = 8 + Number(instr.index) * 8;
                     nasmLines.push(`mov [rax + ${offset}], r10`)
                 } else {
-                    nasmLines.push(`mov rdx, ${memRef(instr.index)}`);
+                    nasmLines.push(`mov rdx, ${indexOperand(instr.index)}`);
                     nasmLines.push(`imul rdx, 8`);
                     nasmLines.push(`add rdx, 8`);
                     nasmLines.push(`mov [rax + rdx], r10`);
@@ -264,8 +316,11 @@ export function emitNASM(instructions: IR[]): string {
 
             case "enter": {
                 resetFrame();
-                nasmLines.push(`global ${instr.name}`);
-                nasmLines.push(`${instr.name}:`);
+                intArgIdx = 0;
+                floatArgIdx = 0;
+                // '$' makes NASM read the name as a symbol even if it is a mnemonic (e.g. 'rep')
+                nasmLines.push(`global $${instr.name}`);
+                nasmLines.push(`$${instr.name}:`);
                 nasmLines.push(`push rbp`);
                 nasmLines.push(`mov rbp, rsp`);
                 nasmLines.push(`sub rsp, ${frameSizes.get(instr.name) ?? 256}`);
@@ -300,9 +355,9 @@ export function emitNASM(instructions: IR[]): string {
             case "arg": {
                 if (instr.isFloat) {
                     floatVars.add(instr.dst);
-                    nasmLines.push(`movsd ${memRef(instr.dst)}, xmm${instr.index}`);
+                    nasmLines.push(`movsd ${memRef(instr.dst)}, xmm${floatArgIdx++}`);
                 } else {
-                    nasmLines.push(`mov qword ${memRef(instr.dst)}, ${sysv[instr.index]}`);
+                    nasmLines.push(`mov qword ${memRef(instr.dst)}, ${sysv[intArgIdx++]}`);
                 }
                 break;
             }
@@ -313,7 +368,7 @@ export function emitNASM(instructions: IR[]): string {
                     nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                     stringTemps.add(instr.dst);
                 } else {
-                    nasmLines.push(`mov qword ${memRef(instr.dst)}, ${instr.value}`);
+                    storeImm(memRef(instr.dst), instr.value);
                 }
                 break;
             }
@@ -325,7 +380,7 @@ export function emitNASM(instructions: IR[]): string {
                     floatVars.add(instr.dst);
                 }
                 if (/^-?\d+$/.test(instr.src)) {
-                    nasmLines.push(`mov qword ${memRef(instr.dst)}, ${instr.src}`);
+                    storeImm(memRef(instr.dst), instr.src);
                 } else {
                     nasmLines.push(`mov rax, ${memRef(instr.src)}`);
                     nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
@@ -384,7 +439,8 @@ export function emitNASM(instructions: IR[]): string {
                     nasmLines.push(`call strlen`);
                     nasmLines.push(`mov ${memRef(instr.dst!)}, rax`);
                 } else if (instr.fn === "printchar") {
-                    nasmLines.push(`mov rsi, ${memRef(instr.args[0])}`);
+                    const arg = loadOperand(instr.args[0]);
+                    nasmLines.push(`mov rsi, [rbp - ${arg}]`);
                     nasmLines.push(`lea rdi, [rel fmt_char]`);
                     nasmLines.push(`xor eax, eax`);
                     nasmLines.push(`call printf`);
@@ -417,7 +473,7 @@ export function emitNASM(instructions: IR[]): string {
                     });
                     if (xmmIdx > 0) nasmLines.push(`mov eax, ${xmmIdx}`);
                     else nasmLines.push(`xor eax, eax`);
-                    nasmLines.push(`call ${instr.fn}`);
+                    nasmLines.push(`call $${instr.fn}`);
                     if (instr.dst) {
                         if (instr.returns_float) {
                             nasmLines.push(`movsd ${memRef(instr.dst)}, xmm0`);
@@ -662,6 +718,9 @@ export function emitNASM(instructions: IR[]): string {
                 const idxSlot = getSlot(`__free2d_idx_${instr.arr}`);
                 const loopLabel = `__free2d_loop_${instr.arr}_${stackOffset}`;
                 const endLabel  = `__free2d_end_${instr.arr}_${stackOffset}`;
+                // a NULL array (never allocated on this path) has no rows to free
+                nasmLines.push(`cmp qword ${memRef(instr.arr)}, 0`);
+                nasmLines.push(`je ${endLabel}`);
                 nasmLines.push(`mov qword [rbp - ${idxSlot}], 0`);
                 nasmLines.push(`${loopLabel}:`);
                 const rowsVal = instr.rows;
@@ -775,7 +834,15 @@ export function emitNASM(instructions: IR[]): string {
             }
             case "str_concat": {
                 stringTemps.add(instr.dst);
-                nasmLines.push(`mov rdi, 256`);
+                // allocate strlen(a) + strlen(b) + 1 bytes
+                const lenSlot = getSlot("__concat_len");
+                nasmLines.push(`mov rdi, ${memRef(instr.a)}`);
+                nasmLines.push(`call strlen`);
+                nasmLines.push(`mov [rbp - ${lenSlot}], rax`);
+                nasmLines.push(`mov rdi, ${memRef(instr.b)}`);
+                nasmLines.push(`call strlen`);
+                nasmLines.push(`add rax, [rbp - ${lenSlot}]`);
+                nasmLines.push(`lea rdi, [rax + 1]`);
                 nasmLines.push(`call malloc`);
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 nasmLines.push(`mov rdi, rax`);
@@ -796,7 +863,7 @@ export function emitNASM(instructions: IR[]): string {
             case "field_store": {
                 nasmLines.push(`mov rax, ${memRef(instr.base)}`);
                 if (/^-?\d+$/.test(instr.src)) {
-                    nasmLines.push(`mov qword [rax + ${instr.offset}], ${instr.src}`);
+                    storeImm(`[rax + ${instr.offset}]`, instr.src, "rcx");
                 } else {
                     nasmLines.push(`mov rcx, ${memRef(instr.src)}`);
                     nasmLines.push(`mov [rax + ${instr.offset}], rcx`);
@@ -848,7 +915,9 @@ export function emitNASM(instructions: IR[]): string {
     if (stringLiterals.size > 0) {
         const dataLines: string[] = [];
         for (const [value, label] of stringLiterals) {
-            dataLines.push(`${label} db '${value}', 0`);
+            // emitted as byte values so quotes in the text can't end the NASM string
+            const bytes = [...Buffer.from(value, "utf8")];
+            dataLines.push(`${label} db ${[...bytes, 0].join(", ")}`);
         }
         const dataIdx = nasmLines.indexOf("section .data") + 1;
         nasmLines.splice(dataIdx + 4, 0, ...dataLines);
@@ -873,7 +942,7 @@ export function emitNASM(instructions: IR[]): string {
         for (const [structName, methods] of vtables) {
             vtableLines.push(`__vtable_${structName}:`)
             methods.forEach( m => {
-                vtableLines.push(`  dq ${m}`)
+                vtableLines.push(`  dq $${m}`)
             })
         }
         nasmLines.splice(dataIdx, 0, ...vtableLines)

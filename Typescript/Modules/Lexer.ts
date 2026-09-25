@@ -65,7 +65,8 @@ export function LexerWithPos(src: string): Token[] {
                     hex += src[i++]; col++;
                 }
                 i--;
-                tokens.push({ value: String(parseInt(hex, 16)), line: startLine, col: startCol });
+                // BigInt keeps every digit (parseInt rounds above 2^53)
+                tokens.push({ value: hex.length > 2 ? BigInt(hex).toString() : String(parseInt(hex, 16)), line: startLine, col: startCol });
             } else {
                 let num = c;
                 while (i + 1 < src.length && /\d/.test(src[i + 1])) {

@@ -31,8 +31,8 @@ export type IR =
     | {op: "alloc", dst: string, size: string | number}
     | {op: "free", addr: string}
     | {op: "lea", dst: string, base: string, offset: string}
-    | {op: "mov", dst: string, src: string}
-    | {op: "const", dst: string, value: number | string}
+    | {op: "mov", dst: string, src: string, decl?: boolean}   // decl: the mov that declares a variable
+    | {op: "const", dst: string, value: number | string | bigint}   // bigint: int beyond 2^53
     | {op: "ret", value?: string}
     | {op: "str_concat", dst: string, a: string, b: string}
     | {op: "cast", dst: string, src: string, type: string}
@@ -83,11 +83,15 @@ export function IRGen(ast: Node): IR[] {
     const floatTemps = new Set<string>();
     const loopStack: { startLabel: string, endLabel: string }[] = [];
     const stringFunctions = new Set<string>();
-    const floatFunctions = new Set<string>();
+    // C runtime functions (Typescript/runtime/graphics.c) that return a double
+    const floatFunctions = new Set<string>(["gfx_time"]);
     const StructLayouts = new Map<string, Map<String, number>>()
     const vtableSlots = new Map<string, Map<string, number>>()
     const structTypeMap = new Map<string, string>()
     let currentStructName: string| undefined
+    const globalNames = new Set<string>();
+    const globalFloatNames = new Set<string>();
+    const functionParamTypes = new Map<string, (string | undefined)[]>();
 
     const fresh = () => `t${tempCount++}`;
     const freshLabel = (hint = "L") => `${hint}_${labelCount++}`;
@@ -177,11 +181,12 @@ export function IRGen(ast: Node): IR[] {
     }
 
     function functionReturnsFloat(node: Node): boolean {
-        const floatVarNames = new Set<string>(
-            node.children
+        const floatVarNames = new Set<string>([
+            ...globalFloatNames,
+            ...node.children
                 .filter(c => c.type === "Identifier" && c.varType === "float")
                 .map(c => c.value!)
-        );
+        ]);
         function collectFloatLocals(n: Node) {
             if (n.type === "VarDecl" && n.varType === "float") floatVarNames.add(n.value!);
             n.children.forEach(collectFloatLocals);
@@ -384,7 +389,10 @@ export function IRGen(ast: Node): IR[] {
                     emit({ op: "fconst", dst, value: Number(node.value) });
                     floatTemps.add(dst);
                 } else {
-                    emit({ op: "const", dst, value: Number(node.value) });
+                    // JS numbers are exact only up to 2^53; beyond that keep the 64-bit value as a bigint
+                    const n = Number(node.value);
+                    const exact = Number.isSafeInteger(n) || !/^-?\d+$/.test(node.value!);
+                    emit({ op: "const", dst, value: exact ? n : BigInt.asIntN(64, BigInt(node.value!)) });
                 }
                 return dst;
             }
@@ -402,14 +410,14 @@ export function IRGen(ast: Node): IR[] {
             }
 
             case "Binary": {
-                // alloc/store/load creates a stack slot both paths write to,
-                // so copy propagation cannot eliminate the writes.
+                // Both paths write a named slot; copyProp keeps movs into named
+                // variables and clears its environment at the labels, so the
+                // writes survive (as with __match_subj_N / __forin_*).
                 if (node.value === "&&" || node.value === "||") {
                     const isAnd = node.value === "&&";
                     const labelShort = freshLabel("sc");
                     const labelEnd = freshLabel("sc");
-                    const slot = fresh();   // a stack-allocated cell
-                    emit({ op: "alloc", dst: slot, size: 8 });
+                    const slot = `__sc_${labelCount}`;
                     const lhsVal = genExpr(node.children[0]);
                     if (isAnd) {
                         emit({ op: "jz", cond: lhsVal, target: labelShort });
@@ -417,15 +425,18 @@ export function IRGen(ast: Node): IR[] {
                         emit({ op: "jnz", cond: lhsVal, target: labelShort });
                     }
                     const rhsVal = genExpr(node.children[1]);
-                    emit({ op: "store", addr: slot, src: rhsVal, type: "i64" });
+                    // the result is a bool: normalise the right operand to 0/1
+                    const rhsBool = fresh();
+                    emit({ op: "neq", dst: rhsBool, a: rhsVal, b: "0" });
+                    emit({ op: "mov", dst: slot, src: rhsBool });
                     emit({ op: "jmp", target: labelEnd });
                     emit({ op: "label", name: labelShort });
                     const shortConst = fresh();
                     emit({ op: "const", dst: shortConst, value: isAnd ? 0 : 1 });
-                    emit({ op: "store", addr: slot, src: shortConst, type: "i64" });
+                    emit({ op: "mov", dst: slot, src: shortConst });
                     emit({ op: "label", name: labelEnd });
                     const dst = fresh();
-                    emit({ op: "load", dst, addr: slot, type: "i64" });
+                    emit({ op: "mov", dst, src: slot });
                     return dst;
                 }
 
@@ -519,7 +530,24 @@ export function IRGen(ast: Node): IR[] {
                     return dst
                 }
 
-                const args = node.children.map(genExpr);
+                // convert int <-> float arguments to the parameter's type, as assignment does
+                const paramTypes = functionParamTypes.get(node.value!);
+                const args = node.children.map((arg, i) => {
+                    const val = genExpr(arg);
+                    const want = paramTypes?.[i];
+                    if (want === "float" && !floatTemps.has(val)) {
+                        const conv = fresh();
+                        emit({ op: "itof", dst: conv, src: val });
+                        floatTemps.add(conv);
+                        return conv;
+                    }
+                    if (want === "int" && floatTemps.has(val)) {
+                        const conv = fresh();
+                        emit({ op: "ftoi", dst: conv, src: val });
+                        return conv;
+                    }
+                    return val;
+                });
                 const dst = fresh();
                 const returnsString = stringFunctions.has(node.value!) || node.value === "inttostr" || node.value === "inputstr";
                 const returnsFloat = floatFunctions.has(node.value!);
@@ -604,6 +632,10 @@ export function IRGen(ast: Node): IR[] {
             case "ArraySlice": {
                 const start = genExpr(node.children[0]);
                 const end = genExpr(node.children[1]);
+                // start is read inside the copy loop, so keep it in a stable named
+                // slot (copyProp clears its environment at the loop label)
+                const startSlot = `__slice_start_${labelCount}`;
+                emit({ op: "mov", dst: startSlot, src: start });
                 const len = fresh();
                 const dst = fresh();
                 emit({ op: "sub", dst: len, a: end, b: start });
@@ -617,7 +649,7 @@ export function IRGen(ast: Node): IR[] {
                 emit({ op: "lt", dst: cond, a: i, b: len });
                 emit({ op: "jz", cond, target: endLabel });
                 const srcIdx = fresh();
-                emit({ op: "add", dst: srcIdx, a: i, b: start });
+                emit({ op: "add", dst: srcIdx, a: i, b: startSlot });
                 const elem = fresh();
                 emit({ op: "array_load", dst: elem, arr: node.value!, index: srcIdx });
                 emit({ op: "array_store", arr: dst, index: i, src: elem });
@@ -638,7 +670,11 @@ export function IRGen(ast: Node): IR[] {
         switch (node.type) {
 
             case "FieldAssign": {
-                const obj = node.children[0]
+                // the parser gives 'this.x = v' an Identifier "this" target; treat it as This
+                const target = node.children[0]
+                const obj: Node = target.type === "Identifier" && target.value === "this"
+                    ? { type: "This", children: [] }
+                    : target
                 const objReg = genExpr(obj)
                 const val = genExpr(node.children[1])
 
@@ -679,18 +715,20 @@ export function IRGen(ast: Node): IR[] {
                     emit({ op: "itof", dst: conv, src });
                     floatTemps.add(conv);
                     floatTemps.add(node.value!);
-                    emit({ op: "mov", dst: node.value!, src: conv });
+                    emit({ op: "mov", dst: node.value!, src: conv, decl: true });
                 } else if (!dstIsFloat && srcIsFloat && node.varType === "int") {
                     // float → int truncation
                     const conv = fresh();
                     emit({ op: "ftoi", dst: conv, src });
-                    emit({ op: "mov", dst: node.value!, src: conv });
+                    emit({ op: "mov", dst: node.value!, src: conv, decl: true });
                 } else {
                     if (dstIsFloat || srcIsFloat) floatTemps.add(node.value!);
-                    emit({ op: "mov", dst: node.value!, src });
+                    emit({ op: "mov", dst: node.value!, src, decl: true });
                 }
                 if (node.children[0].type === "StructInstantiate") {
                     structTypeMap.set(node.value!, node.children[0].value!)
+                } else if (node.varType && /^[A-Z]/.test(node.varType)) {
+                    structTypeMap.set(node.value!, node.varType)
                 }
                 break;
             }
@@ -856,8 +894,9 @@ export function IRGen(ast: Node): IR[] {
 
         emit({ op: "enter", name: node.value!, params });
 
-        for (const v of [...floatTemps]) { if (!/^t\d+$/.test(v)) floatTemps.delete(v); }
-        for (const v of [...stringVars]) { if (!/^t\d+$/.test(v)) stringVars.delete(v); }
+        // forget the previous function's locals, but keep what is known about globals
+        for (const v of [...floatTemps]) { if (!/^t\d+$/.test(v) && !globalNames.has(v)) floatTemps.delete(v); }
+        for (const v of [...stringVars]) { if (!/^t\d+$/.test(v) && !globalNames.has(v)) stringVars.delete(v); }
         structTypeMap.clear();
 
         params.forEach((p, i) => {
@@ -924,6 +963,16 @@ export function IRGen(ast: Node): IR[] {
         });
     }
 
+    for (const c of ast.children.filter(c => c.type === "VarDecl")) {
+        globalNames.add(c.value!);
+        const init = c.children[0];
+        if (c.varType === "float" || (!c.varType && init.type === "Number" && init.varType === "float")) {
+            globalFloatNames.add(c.value!);
+        }
+    }
+    for (const fn of ast.children.filter(c => c.type === "Function")) {
+        functionParamTypes.set(fn.value!, fn.children.filter(c => c.type === "Identifier").map(c => c.varType));
+    }
     collectStringFunctions(ast);
     collectFloatFunctions(ast);
     genProgram(ast);
