@@ -22,9 +22,10 @@ L is a compiled, statically-typed language that produces native Linux binaries. 
 14. [Inline Assembly](#inline-assembly)
 15. [Built-ins](#built-ins)
 16. [Standard Library](#standard-library)
-17. [Graphics](#graphics)
-18. [Full Example](#full-example)
-19. [Nerd Talk](#nerd-talk)
+    - [math](#math)
+    - [graphics](#graphics)
+17. [Full Example](#full-example)
+18. [Nerd Talk](#nerd-talk)
 
 ---
 
@@ -508,61 +509,99 @@ These functions are always available without any import.
 
 ## Standard Library
 
-Import with `import math;` at the top of your file.
+The standard library lives in the `stdlib/` folder next to the compiler. Each file is a module you pull in with `import`:
 
-### Integer Helpers
+| Module     | Import             | Provides                                                  |
+|------------|--------------------|-----------------------------------------------------------|
+| `math`     | `import math;`     | Integer helpers, float conversion, rounding, trig, roots, logs and powers |
+| `graphics` | `import graphics;` | An OpenGL window with pixel drawing, keyboard input and timing |
 
-| Function                  | Description                           |
-|---------------------------|---------------------------------------|
-| `math_abs(int x)`         | Absolute value                        |
-| `math_max(int a, int b)`  | Larger of two integers                |
-| `math_min(int a, int b)`  | Smaller of two integers               |
+Both modules are written in plain L, so you can read `stdlib/*.l` to see exactly how each function works. Every function is prefixed with its module name (`math_`, `gfx_`) to avoid clashing with your own code.
 
-### Float Conversion
+### math
 
-| Function                  | Description                            |
-|---------------------------|----------------------------------------|
-| `math_toint(float x)`     | Truncate float to int (towards zero)   |
-| `math_tofloat(int x)`     | Widen int to float                     |
+```
+import math;
+```
 
-### Rounding
+#### Integer Helpers
 
-| Function                  | Description                            |
-|---------------------------|----------------------------------------|
-| `math_floor(float x)`     | Round down towards −∞                  |
-| `math_roof(float x)`      | Round up towards +∞ (ceiling)          |
-| `math_round(float x)`     | Round to nearest integer               |
+| Function                  | Returns | Description                |
+|---------------------------|---------|----------------------------|
+| `math_abs(int x)`         | `int`   | Absolute value             |
+| `math_max(int a, int b)`  | `int`   | Larger of two integers     |
+| `math_min(int a, int b)`  | `int`   | Smaller of two integers    |
 
-### Float Arithmetic
+#### Conversion
 
-| Function                          | Description                           |
-|-----------------------------------|---------------------------------------|
-| `math_fmod(float x, float step)`  | Float remainder of `x / step`         |
+| Function                  | Returns | Description                            |
+|---------------------------|---------|----------------------------------------|
+| `math_toint(float x)`     | `int`   | Truncate towards zero (`2.9 → 2`, `-2.9 → -2`) |
+| `math_tofloat(int x)`     | `float` | Widen an int to a float                |
 
-### Trigonometry
+#### Rounding
 
-All angles are in **radians**. Precision is roughly 8 significant digits.
+All rounding functions take a `float` and return an `int`.
 
-| Function              | Description           |
-|-----------------------|-----------------------|
-| `math_sin(float x)`  | Sine                  |
-| `math_cos(float x)`  | Cosine                |
-| `math_tan(float x)`  | Tangent               |
+| Function                  | Description                                  | `2.5` | `-2.5` |
+|---------------------------|----------------------------------------------|-------|--------|
+| `math_floor(float x)`     | Round down towards −∞                        | `2`   | `-3`   |
+| `math_roof(float x)`      | Round up towards +∞ (ceiling)                | `3`   | `-2`   |
+| `math_round(float x)`     | Round to nearest; `.5` rounds up (see note)  | `3`   | `-3`   |
 
-Useful constants:
+> For negative inputs the fractional part is always below `0.5`, so `math_round` currently behaves like `math_floor` (e.g. `math_round(-2.3)` gives `-3`).
+
+#### Float Arithmetic
+
+| Function                          | Returns | Description                                                  |
+|-----------------------------------|---------|--------------------------------------------------------------|
+| `math_fmod(float x, float step)`  | `float` | Remainder of `x / step`; takes the sign of `x`               |
+| `math_sqrt(float x)`              | `float` | Square root (20 Newton–Raphson iterations). Returns `0.0` for `x <= 0` |
+| `math_ln(float x)`                | `float` | Natural logarithm. Returns `0.0` for `x <= 0`                |
+| `math_pow(float base, float exp)` | `float` | `base` raised to `exp`, computed as `e^(exp · ln base)`      |
+
+> `math_pow` uses a 7-term Taylor series for `e^t`, so it is accurate when `exp · ln(base)` is small (roughly `|t| < 2`) and drifts for large results. Because it goes through `math_ln`, `base` must be positive.
+
+#### Trigonometry
+
+All angles are in **radians**. Inputs are reduced into `[-π, π]` with `math_fmod` and evaluated with a Taylor series, giving roughly 8 significant digits.
+
+| Function             | Returns | Description |
+|----------------------|---------|-------------|
+| `math_sin(float x)`  | `float` | Sine        |
+| `math_cos(float x)`  | `float` | Cosine      |
+| `math_tan(float x)`  | `float` | Tangent (`sin / cos`) — blows up near `±π/2` |
+
+The module doesn't export constants, so define the ones you need:
 
 ```
 var float pi  = 3.1415926536;
 var float tau = 6.2831853072;   // 2 * pi
 ```
 
----
+#### Example
 
-## Graphics
+```
+import math;
 
-Import with `import graphics;`. Opens an OpenGL window and lets you draw with pixel-coordinate functions — `(0, 0)` is the top-left corner, x grows right, y grows down. Colors are `0xRRGGBB` integers; hex literals are supported directly.
+main() {
+    var float x = 2.0;
+    print(math_round(math_sqrt(x) * 1000.0));   // 1414
+    print(math_floor(-1.5));                     // -2
+    print(math_max(math_abs(-7), 3));            // 7
+    return 0;
+}
+```
 
-### Setup and Loop
+### graphics
+
+```
+import graphics;
+```
+
+Opens an OpenGL window (via GLFW) and lets you draw with pixel coordinates — `(0, 0)` is the top-left corner, x grows right, y grows down. The `gfx_` functions are thin L wrappers around a small C runtime (`Typescript/runtime/graphics.c`) that the compiler always links in, so building any program requires `libglfw` and `libGL` to be installed.
+
+#### Setup and Loop
 
 ```
 import graphics;
@@ -583,41 +622,58 @@ main() {
 }
 ```
 
-### Drawing Functions
+#### Window
 
-| Function                                      | Description                          |
-|-----------------------------------------------|--------------------------------------|
-| `gfx_clear(int color)`                        | Fill the entire screen               |
-| `gfx_set_pixel(int x, int y, int color)`      | Draw a single pixel                  |
-| `gfx_hline(int x, int y, int len, int color)` | Horizontal line                      |
-| `gfx_vline(int x, int y, int len, int color)` | Vertical line                        |
-| `gfx_line(int x0, int y0, int x1, int y1, int color)` | Line between two points     |
-| `gfx_rect(int x, int y, int w, int h, int color)`     | Filled rectangle            |
-| `gfx_rect_border(int x, int y, int w, int h, int color)` | Unfilled rectangle border |
+| Function                   | Returns | Description                                                  |
+|----------------------------|---------|--------------------------------------------------------------|
+| `gfx_init(int w, int h)`   | —       | Open a `w × h` window titled "L Graphics" and set `WIDTH` / `HEIGHT` |
+| `gfx_present()`            | —       | Show this frame: swap buffers and poll input events          |
+| `gfx_closed()`             | `int`   | `1` once the user has closed the window, else `0`            |
+| `gfx_destroy_window()`     | —       | Close the window and shut down GLFW                          |
 
-### Input and Timing
+#### Drawing
 
-| Function                  | Description                                      |
-|---------------------------|--------------------------------------------------|
-| `gfx_closed()`            | Returns `1` when the window has been closed      |
-| `gfx_key(int key)`        | Returns `1` while the given key is held down     |
-| `gfx_get_time()`          | Seconds elapsed since `gfx_init` was called      |
+| Function                                                 | Description                |
+|----------------------------------------------------------|----------------------------|
+| `gfx_clear(int color)`                                   | Fill the entire screen     |
+| `gfx_set_pixel(int x, int y, int color)`                 | Draw a single pixel        |
+| `gfx_hline(int x, int y, int len, int color)`            | Horizontal line of `len` pixels, starting at `(x, y)` |
+| `gfx_vline(int x, int y, int len, int color)`            | Vertical line of `len` pixels, starting at `(x, y)` |
+| `gfx_line(int x0, int y0, int x1, int y1, int color)`    | Line between two points    |
+| `gfx_rect(int x, int y, int w, int h, int color)`        | Filled rectangle           |
+| `gfx_rect_border(int x, int y, int w, int h, int color)` | Rectangle outline          |
 
-Key constants are provided as globals: `KEY_SPACE`, `KEY_ESCAPE`, `KEY_ENTER`, `KEY_W`, `KEY_A`, `KEY_S`, `KEY_D`, `KEY_UP`, `KEY_DOWN`, `KEY_LEFT`, `KEY_RIGHT`, `KEY_SHIFT`.
+#### Colors
 
-### Globals
-
-`WIDTH` and `HEIGHT` are set by `gfx_init` and reflect the window dimensions.
-
-### Colors
-
-Colors are packed `0xRRGGBB` integers:
+Colors are packed `0xRRGGBB` integers, and hex literals work directly:
 
 ```
 gfx_rect(10, 10, 100, 50, 0xFF0000);   // red
 gfx_rect(10, 70, 100, 50, 0x00FF00);   // green
 gfx_rect(10, 130, 100, 50, 0x0000FF);  // blue
 ```
+
+#### Input and Timing
+
+| Function              | Returns | Description                                    |
+|-----------------------|---------|------------------------------------------------|
+| `gfx_key(int key)`    | `int`   | `1` while the given key is held down, else `0` |
+| `gfx_get_time()`      | `float` | Seconds elapsed since `gfx_init`               |
+
+#### Globals
+
+| Global               | Value | Notes |
+|----------------------|-------|-------|
+| `WIDTH`, `HEIGHT`    | `800`, `600` until `gfx_init` runs | Updated by `gfx_init` to the window size |
+| `KEY_SPACE`          | `32`  | |
+| `KEY_A` `KEY_D` `KEY_S` `KEY_W` | `65` `68` `83` `87` | |
+| `KEY_ESCAPE`         | `256` | |
+| `KEY_ENTER`          | `257` | |
+| `KEY_RIGHT` `KEY_LEFT` `KEY_DOWN` `KEY_UP` | `262` `263` `264` `265` | |
+| `KEY_SHIFT`          | `340` | Left shift |
+
+Key codes are GLFW key codes, so any key not listed can be passed as a number (e.g. `gfx_key(81)` for Q).
+
 
 ---
 
