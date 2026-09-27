@@ -433,7 +433,9 @@ export function insertFrees(ir: IR[]): IR[] {
                                 globalStores.add(fi);
                             }
                         }
-                        const srcDepth = varScope.get(fi.src);
+                        const borrowsVariable = !/^t\d+$/.test(fi.src) && !fi.src.startsWith("__") &&
+                            !/^t\d+$/.test(fi.dst) && !globals.has(fi.dst);
+                        const srcDepth = borrowsVariable ? undefined : varScope.get(fi.src);
                         if (srcDepth === undefined && !/^t\d+$/.test(fi.dst) && !globals.has(fi.dst) && !/^-?\d+$/.test(fi.src)) {
                             borrowMovs.add(fi);
                         }

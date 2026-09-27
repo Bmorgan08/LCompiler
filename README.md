@@ -61,6 +61,7 @@ node dist/Main.js hello.l hello     # compiles to ./hello
 | `--tokens`  | Print the token stream                |
 | `--verbose` | Print all of the above                |
 | `--check`   | Only check for errors; write no files |
+| `--nolibc`  | Link against L's own runtime instead of the C library |
 
 ## Tests
 
@@ -71,6 +72,7 @@ node Test/RegressionTests.js            # older whole-program tests (from the or
 node Test/IRTests.js                    # --ir output and optimizer passes
 node Test/ServerTests.js                # --check and the language server's diagnostics
 node Test/LanguageTests.js --memcheck --leaks   # also run every test under AddressSanitizer
+node Test/LanguageTests.js --nolibc             # compile every test with --nolibc (runtime/nolibc.c instead of libc)
 ```
 
 Rebuild with `npx tsc` first; the tests run `dist/Main.js`. `Test/known-bugs.js` records every bug found so far and how it was fixed.
@@ -98,6 +100,7 @@ Typescript/            compiler source (TypeScript)
   Modules/Optimize.ts  copy propagation, CSE, and where values are freed
   Modules/Emitter.ts   IR -> NASM
   runtime/lrt.c        C runtime for growable arrays and maps (built into lrt.o on first use)
+  runtime/nolibc.c     replacement for the C library, used with --nolibc
   runtime/graphics.c   C runtime for the graphics module
 stdlib/                standard library modules (.l); string.l is imported automatically
 client/                VS Code extension client

@@ -1478,6 +1478,217 @@ const tests = [
       source: `function double(int x): int { return x * 2; }\n` + main(lines("var string s = \"hello\";", "var int len = len(s);", "var int double = double(len);", "print(len);", "print(double);", "print(len(\"ab\"));")),
       expected: "5\n10\n2" },
 
+    // ── Allocator stress (also run with --nolibc to check runtime/nolibc.c's allocator) ──
+
+    { name: "alloc: strings of many sizes, some removed along the way",
+      source: `main() {
+    var string[] words = [];
+    var i = 0;
+    while (i < 3000) {
+        var string w = "";
+        var j = 0;
+        while (j < i % 37) {
+            w = w + chartostr('a' + (i + j) % 26);
+            j++;
+        }
+        words.push(w);
+        if (i % 3 == 0 && words.len() > 5) {
+            words.remove(words.len() / 2);
+        }
+        i++;
+    }
+    var total = 0;
+    for (w in words) {
+        total += len(w);
+        if (len(w) > 0) { total += w[len(w) - 1]; }
+    }
+    print(words.len());
+    print(total);
+    return 0;
+}
+`,
+      expected: "2002\n249150",
+      memcheck: true, leaks: true },
+    { name: "alloc: an array grown past the allocator's chunk size, and an 8 MB array",
+      source: `main() {
+    var int[] big = [];
+    var i = 0;
+    while (i < 300000) {
+        big.push(i * 3);
+        i++;
+    }
+    print(big.len());
+    print(big[0] + big[150000] + big[299999]);
+    var int[] huge = new int[1000000];
+    huge[999999] = 7;
+    huge[0] = 5;
+    print(huge[0] + huge[999999] + huge[500000]);
+    return 0;
+}
+`,
+      expected: "300000\n1349997\n12",
+      memcheck: true, leaks: true },
+    { name: "alloc: arrays of many sizes freed and replaced out of order",
+      source: `main() {
+    var int[][] rows = [];
+    var i = 0;
+    while (i < 500) {
+        var int[] r = new int[(i * 7) % 90 + 1];
+        r[0] = i;
+        r[r.len() - 1] = i * 2;
+        rows.push(r);
+        i++;
+    }
+    var k = 0;
+    while (k < 200) {
+        var int[] gone = rows.remove((k * 13) % rows.len());
+        k++;
+    }
+    var j = 0;
+    while (j < 200) {
+        var int[] r = new int[(j * 11) % 60 + 2];
+        r[0] = 1000 + j;
+        r[r.len() - 1] = j;
+        rows.insert(j % rows.len(), r);
+        j++;
+    }
+    var sum = 0;
+    for (r in rows) { sum += r[0] + r[r.len() - 1] + r.len(); }
+    print(rows.len());
+    print(sum);
+    return 0;
+}
+`,
+      expected: "500\n489170",
+      memcheck: true, leaks: true },
+    { name: "alloc: a map's keys and values replaced and removed over several rounds",
+      source: `main() {
+    var map<string, string> m = {};
+    var round = 0;
+    while (round < 4) {
+        var i = 0;
+        while (i < 2000) {
+            m[inttostr(i)] = inttostr(i * round) + "v";
+            i++;
+        }
+        var r = 0;
+        while (r < 2000) {
+            if (r % 3 == round % 3) { m.remove(inttostr(r)); }
+            r++;
+        }
+        round++;
+    }
+    var total = 0;
+    for (k in m) { total += strtoint(k) + len(m[k]); }
+    print(m.len());
+    print(total);
+    return 0;
+}
+`,
+      expected: "1333\n1339086",
+      memcheck: true, leaks: true },
+    { name: "alloc: a string grown one character at a time, floats pushed and popped",
+      source: `main() {
+    var string s = "";
+    var i = 0;
+    while (i < 5000) {
+        s = s + inttostr(i % 10);
+        i++;
+    }
+    print(len(s));
+    print(s[0..10]);
+    print(s[4990..5000]);
+    var float[] fs = [];
+    var k = 0;
+    while (k < 1000) {
+        fs.push(k * 0.5);
+        k++;
+    }
+    var float acc = 0.0;
+    while (fs.len() > 0) { acc = acc + fs.pop(); }
+    print(acc);
+    return 0;
+}
+`,
+      expected: "5000\n0123456789\n0123456789\n249750",
+      memcheck: true, leaks: true },
+    { name: "alloc: linked lists of structs built and walked many times",
+      source: `struct Node {
+    var val: int;
+    var name: string;
+    var next: Node = none;
+}
+main() {
+    var total = 0;
+    var round = 0;
+    while (round < 50) {
+        var head = Node { val: 0, name: "n0" };
+        var i = 1;
+        while (i < 200) {
+            head = Node { val: i, name: "n" + inttostr(i), next: head };
+            i++;
+        }
+        var Node cur = head;
+        while (true) {
+            total += cur.val + len(cur.name);
+            if (cur.next == none) { break; }
+            cur = cur.next;
+        }
+        round++;
+    }
+    print(total);
+    return 0;
+}
+`,
+      expected: "1029500",
+      memcheck: true, leaks: true },
+    { name: "borrow: walking a list built in a loop doesn't free it (B60)",
+      source: `struct Node {
+    var val: int;
+    var next: Node = none;
+}
+main() {
+    var head = Node { val: 0 };
+    var i = 1;
+    while (i < 5) {
+        head = Node { val: i, next: head };
+        i++;
+    }
+    var total = 0;
+    var Node cur = head;
+    while (true) {
+        total += cur.val;
+        if (cur.next == none) { break; }
+        cur = cur.next;
+    }
+    print(total);
+    return 0;
+}
+`,
+      expected: "10",
+      memcheck: true, leaks: true },
+    { name: "borrow: a variable assigned in an if, borrowed then reassigned (B60)",
+      source: `struct P {
+    var n: int;
+    var next: P = none;
+}
+main() {
+    var p = P { n: 1, next: P { n: 5 } };
+    var x = input();
+    if (x > 0) {
+        p = P { n: 2, next: P { n: 3 } };
+    }
+    var P q = p;
+    q = q.next;
+    print(p.n);
+    print(q.n);
+    return 0;
+}
+`,
+      stdin: "1\n",
+      expected: "2\n3",
+      memcheck: true, leaks: true },
+
     // ── Several errors in one program ────────────────────────────────────
     // (the regexes match all of stderr, so they also check no other errors are reported)
 

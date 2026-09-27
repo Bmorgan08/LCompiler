@@ -51,8 +51,29 @@ node dist/Main.js hello.l hello    # compiles to ./hello
 | `--tokens`  | Print the token stream                 |
 | `--verbose` | Print all of the above                 |
 | `--check`   | Only check the program: report its errors and exit 1, or exit 0; no files are written |
+| `--nolibc`  | Link without the C library (see [Without the C Library](#without-the-c-library)) |
 
 Errors include the source location: `line:col: message`. Every type and memory-safety error in the program is reported, one per line; a syntax error stops the compiler at the first one, since the code after it can't be read reliably. The VS Code extension runs `--check` whenever a file is opened or saved and shows the errors in the editor.
+
+### Without the C Library
+
+Normally a program is linked against the C library, which provides `malloc`, `printf` and the rest. With `--nolibc` it is linked against L's own runtime, `Typescript/runtime/nolibc.c`, instead:
+
+```sh
+node dist/Main.js hello.l hello --nolibc
+```
+
+The result is a static binary that depends on nothing but the Linux kernel. `nolibc.c` provides everything a compiled program uses:
+
+- the entry point (`_start`, which calls `main` and exits with what it returns)
+- a memory allocator (`malloc`, `calloc`, `realloc`, `free`)
+- string and memory functions
+- buffered output (`printf`, `sprintf`, with `%ld`, `%s`, `%c` and `%g`)
+- input (`scanf`, `fgets`, `atoi`)
+
+Programs behave the same either way; the whole test suite runs in both modes. The [graphics](#graphics) module needs GLFW and OpenGL, which need the C library, so a program that imports it is rejected with `--nolibc`.
+
+Everything in `nolibc.c` reaches the operating system through two functions, `syscall3` and `syscall6`, which make the Linux `read`, `write`, `mmap` and `exit_group` system calls. To run L programs on another operating system (your own kernel, for example), those two functions are the part to replace.
 
 ---
 

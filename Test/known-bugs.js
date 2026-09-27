@@ -346,6 +346,15 @@ module.exports = {
         cause: "Parser.ts collected the for-in source up to the first ')', which was the call's own.",
         fixed: "Parser.ts tracks parenthesis depth when collecting the for-in source.",
     },
+    B60: {
+        title: "Borrowing a variable assigned in a loop or an if, then reassigning the borrower, freed the original",
+        cause: "Optimize.ts insertFrees (first pass) treated `mov cur = head` as moving ownership from head to cur whenever head currently owned a value. " +
+               "copyProp usually rewrites such a mov to the allocation's temp, hiding it, but not when head was assigned in a loop or an if. " +
+               "cur then owned head's struct, so `cur = cur.next` freed it; and heldBy (built in one pass over the whole function) " +
+               "made a store of head into a field inside the loop zero cur instead of head. Found by the allocator stress tests.",
+        fixed: "Optimize.ts insertFrees: a mov from one named variable into another local is a borrow (srcDepth undefined), so the source keeps owning; " +
+               "only a temp's value, or a move into a global, transfers ownership.",
+    },
 
     S1: {
         title: "math_sqrt is inaccurate for large and tiny inputs",

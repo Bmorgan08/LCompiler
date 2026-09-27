@@ -18,11 +18,14 @@ const tokensOnly = process.argv.includes("--tokens");
 // --check: report the errors (each as "Error: line:col: message") and exit 1, or exit 0, without
 // writing any files; the language server runs this on save
 const checkOnly = process.argv.includes("--check");
+// --nolibc: link against runtime/nolibc.c (our own malloc, printf, syscalls, _start) instead of the C
+// library, so the program depends on nothing but the kernel; the graphics module isn't available
+const noLibc = process.argv.includes("--nolibc");
 
 const [inputFile, outputFile = "output"] = process.argv.slice(2).filter((a: string) => !a.startsWith("--"));
 
 if (!inputFile) {
-    console.error("Usage: node Main.js <source-file> [output-file] [--check] [--ir] [--ast] [--asm] [--tokens] [--verbose]");
+    console.error("Usage: node Main.js <source-file> [output-file] [--check] [--nolibc] [--ir] [--ast] [--asm] [--tokens] [--verbose]");
     process.exit(1);
 }
 
@@ -248,24 +251,48 @@ try {
 } catch (e: any) {
     die(`NASM error:\n${e.stderr?.toString() ?? e.message}`);
 }
-// the L runtime (arrays, maps) is built from lrt.c when lrt.o is missing or older than it; it is
+const runtimeDir = path.resolve(__dirname, "../Typescript/runtime");
+
+// builds runtime/<name>.c into <object>.o when the object is missing or older than the source; it is
 // written to a temporary file and renamed, so compilers running at the same time can't see half a file
-const lrtC = path.resolve(__dirname, "../Typescript/runtime/lrt.c");
-const lrtO = path.resolve(__dirname, "../Typescript/runtime/lrt.o");
-try {
-    if (!fs.existsSync(lrtO) || fs.statSync(lrtO).mtimeMs < fs.statSync(lrtC).mtimeMs) {
-        const tmp = `${lrtO}.${process.pid}.tmp`;
-        chldproc.execSync(`gcc -c -O2 ${lrtC} -o ${tmp}`, { stdio: "pipe" });
-        fs.renameSync(tmp, lrtO);
+function buildRuntime(name: string, object: string, flags: string): string {
+    const c = path.join(runtimeDir, `${name}.c`);
+    const o = path.join(runtimeDir, `${object}.o`);
+    try {
+        if (!fs.existsSync(o) || fs.statSync(o).mtimeMs < fs.statSync(c).mtimeMs) {
+            const tmp = `${o}.${process.pid}.tmp`;
+            chldproc.execSync(`gcc -c -O2 ${flags} ${c} -o ${tmp}`, { stdio: "pipe" });
+            fs.renameSync(tmp, o);
+        }
+    } catch (e: any) {
+        die(`Could not build the L runtime (${name}.c):\n${e.stderr?.toString() ?? e.message}`);
     }
-} catch (e: any) {
-    die(`Could not build the L runtime (lrt.c):\n${e.stderr?.toString() ?? e.message}`);
+    return o;
 }
-try {
-    const graphicsO = path.resolve(__dirname, "../Typescript/runtime/graphics.o");
-    chldproc.execSync(`gcc ${outputFile}.o ${graphicsO} ${lrtO} -o ${outputFile} -no-pie -lglfw -lGL`, { stdio: "pipe" });
-} catch (e: any) {
-    die(`Linker error:\n${e.stderr?.toString() ?? e.message}`);
+
+if (noLibc) {
+    // a call into graphics.c (which needs GLFW and OpenGL, and so the C library)
+    const graphicsCall = /^\s*call\s+\$?(gfx_c_\w+|gfx_window_init|gfx_should_close|gfx_swap|gfx_destroy|gfx_key_down|gfx_time|gfx_log)\s*$/m;
+    if (graphicsCall.test(nasm)) die("The graphics module needs the C library, so it can't be used with --nolibc");
+    // No C library means no stack-protector canary (it's read through the fs register, which libc sets
+    // up) and no builtins: gcc must not turn nolibc.c's own memset loop into a call to memset
+    const flags = "-ffreestanding -fno-builtin -fno-stack-protector -fno-pie";
+    const lrtO = buildRuntime("lrt", "lrt-nolibc", flags);   // arrays and maps, built separately from the libc version
+    const noLibcO = buildRuntime("nolibc", "nolibc", flags);
+    try {
+        // libgcc supplies the few helpers gcc itself may call (it doesn't need the C library)
+        chldproc.execSync(`gcc ${outputFile}.o ${lrtO} ${noLibcO} -o ${outputFile} -nostdlib -static -no-pie -lgcc`, { stdio: "pipe" });
+    } catch (e: any) {
+        die(`Linker error:\n${e.stderr?.toString() ?? e.message}`);
+    }
+} else {
+    const lrtO = buildRuntime("lrt", "lrt", "");   // arrays and maps
+    try {
+        const graphicsO = path.join(runtimeDir, "graphics.o");
+        chldproc.execSync(`gcc ${outputFile}.o ${graphicsO} ${lrtO} -o ${outputFile} -no-pie -lglfw -lGL`, { stdio: "pipe" });
+    } catch (e: any) {
+        die(`Linker error:\n${e.stderr?.toString() ?? e.message}`);
+    }
 }
 
 if (asm) {

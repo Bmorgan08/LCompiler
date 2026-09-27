@@ -17,13 +17,16 @@
 //              If it passes, it is reported as XPASS so the marker can be removed.
 //   gfx        needs a display; only run with --gfx
 //
-// Usage: node Test/<Suite>.js [filter] [--verbose] [--memcheck] [--leaks] [--gfx] [--bugs]
+// Usage: node Test/<Suite>.js [filter] [--verbose] [--memcheck] [--leaks] [--gfx] [--bugs] [--nolibc]
 //   filter      only run tests whose name contains this text
 //   --verbose   print compiler output and program output for failures
 //   --memcheck  memory-check every test, not just the ones marked memcheck
 //   --leaks     also report memory leaks in memory-checked tests
 //   --gfx       include tests that open a window
 //   --bugs      only run tests marked with a bug id
+//   --nolibc    compile every test with --nolibc (our own runtime, runtime/nolibc.c, instead of the C
+//               library). Tests using the graphics module are skipped, and so are memory checks:
+//               AddressSanitizer needs the C library's allocator
 
 const { execFile } = require("child_process");
 const fs = require("fs");
@@ -84,7 +87,7 @@ async function runTest(test, flags) {
             fs.writeFileSync(path.join(dir, rel), content);
         }
 
-        const compile = await run("node", [COMPILER, src, bin], { cwd: dir, timeout: COMPILE_TIMEOUT });
+        const compile = await run("node", [COMPILER, src, bin, ...(flags.nolibc ? ["--nolibc"] : [])], { cwd: dir, timeout: COMPILE_TIMEOUT });
         if (compile.timedOut) {
             return { ok: false, reason: `compiler did not finish within ${COMPILE_TIMEOUT / 1000}s` };
         }
@@ -120,7 +123,7 @@ async function runTest(test, flags) {
             return { ok: false, reason: "wrong output", expected: want, got };
         }
 
-        if ((test.memcheck || flags.memcheck) && asanAvailable()) {
+        if ((test.memcheck || flags.memcheck) && !flags.nolibc && asanAvailable()) {
             // relink the generated assembly the same way Main.ts does, plus AddressSanitizer
             const graphicsO = path.join(ROOT, "Typescript", "runtime", "graphics.o");
             const lrtO = path.join(ROOT, "Typescript", "runtime", "lrt.o");
@@ -150,6 +153,7 @@ async function runSuite(title, tests) {
         leaks: args.includes("--leaks"),
         gfx: args.includes("--gfx"),
         bugsOnly: args.includes("--bugs"),
+        nolibc: args.includes("--nolibc"),
     };
     const filter = args.find(a => !a.startsWith("--"));
 
@@ -163,6 +167,7 @@ async function runSuite(title, tests) {
     const selected = tests.filter(t =>
         (!filter || t.name.includes(filter)) &&
         (!t.gfx || flags.gfx) &&
+        (!flags.nolibc || !/^\s*import\s+graphics\b/m.test(t.source ?? "")) &&   // graphics needs the C library
         (!flags.bugsOnly || t.bug));
     const skipped = tests.length - selected.length;
 
@@ -221,7 +226,9 @@ async function runSuite(title, tests) {
             console.log(`  ${id.padEnd(4)} ${c.xfail} failing, ${c.xpass} passing  - ${knownBugs[id].title}`);
         }
     }
-    if ((selected.some(t => t.memcheck) || flags.memcheck) && !asanAvailable()) {
+    if (flags.nolibc && (selected.some(t => t.memcheck) || flags.memcheck)) {
+        console.log("\n--nolibc: memory checks were skipped (AddressSanitizer needs the C library)");
+    } else if ((selected.some(t => t.memcheck) || flags.memcheck) && !asanAvailable()) {
         console.log("\nAddressSanitizer unavailable (gcc -fsanitize=address failed): memory checks were skipped");
     }
     process.exitCode = counts.fail || counts.xpass ? 1 : 0;

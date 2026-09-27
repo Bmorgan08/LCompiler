@@ -1,6 +1,6 @@
 # TODO
 
-Every tracked bug (B19-B59, S1-S3) is fixed; their diagnoses and fixes are in
+Every tracked bug (B19-B60, S1-S3) is fixed; their diagnoses and fixes are in
 `Test/known-bugs.js`. A new bug gets an id there and tests marked with it in
 `Test/LanguageTests.js` / `Test/StdlibTests.js`; they are expected to fail until it is
 fixed, and `node Test/LanguageTests.js --bugs` runs just those tests.
