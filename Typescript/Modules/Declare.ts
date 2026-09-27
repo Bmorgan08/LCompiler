@@ -6,7 +6,7 @@ export function declare(node: Node, scope: Scope) {
 
         case "StructDef": {
             const fields: StructField[] = []
-            const methods = new Map<string, { params:number }>()
+            const methods = new Map<string, { params: number, returnType?: string }>()
 
             if (node.parent) {
                 const parentDef = lookupStruct(node.parent)
@@ -22,7 +22,8 @@ export function declare(node: Node, scope: Scope) {
                     fields.push({
                         name: f.value!,
                         type: f.varType ?? "unknown" as any,
-                        isConst: f.isConst ?? false
+                        isConst: f.isConst ?? false,
+                        default: f.children[0]
                     })
                 })
         
@@ -30,7 +31,7 @@ export function declare(node: Node, scope: Scope) {
                 .filter(c => c.type === "StructMethod")
                 .forEach(m => {
                     const paramCount = m.children.filter(c => c.type === "Identifier").length
-                    methods.set(m.value!, { params: paramCount })
+                    methods.set(m.value!, { params: paramCount, returnType: m.varType })
                 })
 
             node.children
@@ -38,7 +39,7 @@ export function declare(node: Node, scope: Scope) {
             .forEach(o => {
                 o.children.forEach(m => {
                     const paramCount = m.children.filter(c => c.type === "Identifier").length;
-                    methods.set(m.value!, { params: paramCount });
+                    methods.set(m.value!, { params: paramCount, returnType: m.varType });
                 });
             });
 
@@ -76,7 +77,8 @@ export function declare(node: Node, scope: Scope) {
             define(scope, {
                 name: node.value!,
                 kind: "func",
-                params: node.children.filter(c => c.type === "Identifier").length
+                params: node.children.filter(c => c.type === "Identifier").length,
+                type: node.varType     // the declared return type, if any
             });
 
             const fnScope = createScope(scope);

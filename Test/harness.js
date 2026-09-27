@@ -9,6 +9,7 @@
 //   files      extra files to write next to the source, e.g. { "headers/util.l": "..." }
 //   shouldError  compilation must fail; errorMatch (RegExp) is checked against the compiler's stderr
 //   exitCode   expected exit status of the program (default 0 is not checked unless set)
+//   stderrMatch  RegExp the program's stderr must match (e.g. a runtime error message)
 //   memcheck   also relink the program with AddressSanitizer and fail on any memory error
 //              (invalid/double free, heap overflow, use-after-free seen by libc calls)
 //   leaks      with memcheck, also fail on memory leaks
@@ -105,6 +106,9 @@ async function runTest(test, flags) {
         if (test.exitCode !== undefined && result.code !== test.exitCode) {
             return { ok: false, reason: `exit code ${result.code}, expected ${test.exitCode}`, detail: result.stdout.slice(0, 2000) };
         }
+        if (test.stderrMatch && !test.stderrMatch.test(result.stderr)) {
+            return { ok: false, reason: `stderr did not match ${test.stderrMatch}`, detail: result.stderr.slice(0, 2000) };
+        }
         if (test.exitCode === undefined && result.code !== 0 && result.code !== null) {
             // main's return value becomes the exit code; tests all return 0
             return { ok: false, reason: `exit code ${result.code}`, detail: result.stdout.slice(0, 2000) };
@@ -119,8 +123,9 @@ async function runTest(test, flags) {
         if ((test.memcheck || flags.memcheck) && asanAvailable()) {
             // relink the generated assembly the same way Main.ts does, plus AddressSanitizer
             const graphicsO = path.join(ROOT, "Typescript", "runtime", "graphics.o");
+            const lrtO = path.join(ROOT, "Typescript", "runtime", "lrt.o");
             const asm = await run("nasm", ["-f", "elf64", "main.asm", "-o", "main.o"], { cwd: dir });
-            const link = asm.code === 0 && await run("gcc", ["main.o", graphicsO, "-o", "main_asan", "-no-pie", "-fsanitize=address", "-lglfw", "-lGL"], { cwd: dir });
+            const link = asm.code === 0 && await run("gcc", ["main.o", graphicsO, lrtO, "-o", "main_asan", "-no-pie", "-fsanitize=address", "-lglfw", "-lGL"], { cwd: dir });
             if (!link || link.code !== 0) {
                 return { ok: false, reason: "could not relink with AddressSanitizer", detail: (link ? link.stderr : asm.stderr).trim() };
             }

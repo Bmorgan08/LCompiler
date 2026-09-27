@@ -1,4 +1,5 @@
 import { IR } from "./IR";
+import { tupleTypeParts } from "./Scope";
 
 export function emitNASM(instructions: IR[]): string {
     const nasmLines: string[] = [
@@ -6,14 +7,19 @@ export function emitNASM(instructions: IR[]): string {
         "fmt db '%ld', 10, 0",
         "fmt_in db '%ld', 0",
         "fmt_str db '%s', 10, 0",
-        "fmt_str_in db '%255s', 0",
+        "nl_str db 10, 0",        
+        "__after_num dq 0",       
         "fmt_char db '%c', 0",
         "fmt_float db '%g', 10, 0",
+        "fmt_g db '%g', 0",
         "bounds_msg db 'Error: index out of bounds', 10",
         "",
         "section .text", 
         "extern printf",
         "extern scanf",
+        "extern fgets",
+        "extern strcspn",
+        "extern stdin",
         "extern malloc",
         "extern calloc",
         "extern strcpy",
@@ -23,6 +29,24 @@ export function emitNASM(instructions: IR[]): string {
         "extern atoi",
         "extern sprintf",
         "extern free",
+        "extern lrt_arr_new",
+        "extern lrt_arr_push",
+        "extern lrt_arr_pop",
+        "extern lrt_arr_insert",
+        "extern lrt_arr_remove",
+        "extern lrt_arr_free",
+        "extern lrt_map_new",
+        "extern lrt_map_set",
+        "extern lrt_map_get",
+        "extern lrt_map_has",
+        "extern lrt_map_remove",
+        "extern lrt_map_len",
+        "extern lrt_map_keys",
+        "extern lrt_map_free",
+        "extern memcpy",
+        "extern strstr",
+        "extern fflush",
+        "extern exit",
         "extern gfx_window_init",
         "extern gfx_should_close",
         "extern gfx_swap",
@@ -61,10 +85,10 @@ export function emitNASM(instructions: IR[]): string {
             for (const instr of globalInits) {
                 const i = instr as any;
                 if (!i.dst) continue;
-                if (instr.op === "string_const" || instr.op === "str_concat" ||
+                if (instr.op === "string_const" || instr.op === "str_concat" || instr.op === "str_dup" || instr.op === "str_sub" ||
                     (instr.op === "const" && typeof instr.value === "string") ||
                     (instr.op === "field_load" && instr.is_string) ||
-                    (instr.op === "call" && (instr.returns_string || instr.fn === "inttostr" || instr.fn === "inputstr"))) {
+                    (instr.op === "call" && (instr.returns_string || ["inttostr", "inputstr", "chartostr", "str_upper", "str_lower", "floattostr"].includes(instr.fn)))) {
                     strs.add(i.dst);
                 }
                 if (["fconst", "fadd", "fsub", "fmul", "fdiv", "fneg", "itof"].includes(instr.op) ||
@@ -88,6 +112,75 @@ export function emitNASM(instructions: IR[]): string {
 
     let stackMap = new Map<string, number>();
     let stackOffset = 0;
+    let freeSkipCount = 0
+    let strOpCount = 0
+    let usesUnsetFail = false
+    let usesFreeDyn = false
+
+    // ── Freeing by type ──
+    // A value that owns other heap values (a string[], a struct with string fields, a P[], an
+    // int[][], a tuple holding strings, ...) is freed by a routine generated for its type, which
+    // frees what it owns first. A struct field of its own type is fine: the routine calls itself.
+    const layouts = new Map<string, { offset: number, type: string }[]>();
+    const dynamicStructs = new Set<string>();   // structs with a vtable: freed through its slot 0
+    for (const instr of instructions) if (instr.op === "type_layout") {
+        layouts.set(instr.name, instr.fields);
+        if (instr.dynamic) dynamicStructs.add(instr.name);
+    }
+    const neededFrees = new Set<string>();
+    const isHeapElem = (t: string) => t === "string" || t.endsWith("[]") || /^[A-Z]/.test(t) || t.startsWith("(") || t.startsWith("map<");
+    const tupleParts = (t: string) => tupleTypeParts(t);
+    function needsDeepFree(t: string | undefined): boolean {
+        if (!t) return false;
+        if (t.endsWith("[]")) return true;   // an array is a header plus its elements: always a routine
+        if (t.startsWith("map<")) return true;
+        if (t.startsWith("(") && t.endsWith(")")) return tupleParts(t).some(isHeapElem);
+        if (/^[A-Z]/.test(t)) return dynamicStructs.has(t) || (layouts.get(t)?.length ?? 0) > 0;
+        return false;
+    }
+    // unambiguous for nested types: "(" -> T_, ")" -> _E, "," -> _, "[]" -> _arr
+    const mapParts = (t: string) => { const [key, value] = tupleTypeParts(`(${t.slice(4, -1)})`); return { key, value }; };
+    const mangle = (t: string) => t.replace(/\[\]/g, "_arr").replace(/\(/g, "T_").replace(/\)/g, "_E").replace(/,/g, "_").replace(/</g, "_L_").replace(/>/g, "_G_");
+    // the routine that frees a value of type t (plain free when it owns nothing else)
+    function freeFn(t: string | undefined): string {
+        if (!needsDeepFree(t)) return "free";
+        // the actual struct may be a child of t: free it through its own vtable
+        if (dynamicStructs.has(t!)) { usesFreeDyn = true; return "__free_dyn"; }
+        neededFrees.add(t!);
+        return `__free_${mangle(t!)}`;
+    }
+    // `name` is the routine's label; dynamic structs use __freeobj_<Struct> (their vtable's slot 0)
+    function emitFreeRoutine(t: string, name = freeFn(t)): string[] {
+        if (t.startsWith("map<")) {
+            // lrt_map_free(map, value free routine or NULL); string keys are freed by the runtime
+            const value = mapParts(t).value;
+            return [`${name}:`, isHeapElem(value) ? `lea rsi, [rel ${freeFn(value)}]` : `xor esi, esi`, `jmp lrt_map_free`];
+        }
+        if (t.endsWith("[]")) {
+            // lrt_arr_free(array, element free routine or NULL)
+            const elem = t.slice(0, -2);
+            return [`${name}:`, isHeapElem(elem) ? `lea rsi, [rel ${freeFn(elem)}]` : `xor esi, esi`, `jmp lrt_arr_free`];
+        }
+        const out = [
+            `${name}:`,
+            `push rbx`,
+            `push r12`,
+            `sub rsp, 8`,
+            `mov rbx, rdi`,
+            `test rbx, rbx`,
+            `jz .done`,
+        ];
+        if (t.startsWith("(")) {
+            tupleParts(t).forEach((e, i) => {
+                if (isHeapElem(e)) out.push(`mov rdi, [rbx + ${i * 8}]`, `call ${freeFn(e)}`);
+            });
+        } else {
+            for (const f of layouts.get(t) ?? []) out.push(`mov rdi, [rbx + ${f.offset}]`, `call ${freeFn(f.type)}`);
+        }
+        out.push(`mov rdi, rbx`, `call free`, `.done:`, `add rsp, 8`, `pop r12`, `pop rbx`, `ret`);
+        return out;
+    }
+    let inputCount = 0 
     const stringLiterals = new Map<string, string>();
     const stringTemps = new Set<string>(globalStrings);
     let stringCount = 0;
@@ -114,6 +207,10 @@ export function emitNASM(instructions: IR[]): string {
             if (i.addr) simSlot(i.addr);
             if (i.base) simSlot(i.base);
             if (i.cond) simSlot(i.cond);
+            // operands of the newer ops (maps, substrings, indirect calls, array insert/remove)
+            for (const k of ["start", "end", "key", "map", "target", "index"]) {
+                if (typeof i[k] === "string" && !/^-?\d+$/.test(i[k])) simSlot(i[k]);
+            }
             if (i.value && typeof i.value === "string" && !/^-?\d+$/.test(i.value)) simSlot(i.value);
             if (i.args) (i.args as string[]).forEach(a => { if (!/^-?\d+$/.test(a)) simSlot(a); });
             if (i.dst && /^-?\d+$/.test(i.dst)) simSlot(`__lit_${i.dst}`);
@@ -134,6 +231,7 @@ export function emitNASM(instructions: IR[]): string {
             } else {
                 simOperands(instr);
                 if (instr.op === "str_concat") simSlot("__concat_len");
+                if (instr.op === "str_sub") { simSlot("__strsub_len"); simSlot("__strsub_start"); simSlot("__strsub_end"); }
                 if (instr.op === "array_free_2d") {
                     simSlot(`__free2d_idx_${instr.arr}`);
                     if (typeof instr.rows === "string" && !/^-?\d+$/.test(instr.rows)) simSlot(instr.rows);
@@ -239,78 +337,85 @@ export function emitNASM(instructions: IR[]): string {
     for (const instr of instructions) {
         switch (instr.op) {
             
+            // An array is a header {len, cap, data} (see Typescript/runtime/lrt.c); elements are
+            // 8-byte slots at data[i]. The header never moves, so a grown array stays valid everywhere.
             case "array_new": {
-                if (typeof instr.size === "number") {
-                    nasmLines.push(`mov rdi, ${8 + instr.size * 8}`);
-                } else {
-                    nasmLines.push(`mov rax, ${memRef(instr.size)}`);
-                    nasmLines.push(`imul rax, 8`);
-                    nasmLines.push(`add rax, 8`);
-                    nasmLines.push(`mov rdi, rax`);
-                }
-                // calloc(1, bytes): new arrays are zero-initialised
-                nasmLines.push(`mov rsi, rdi`);
-                nasmLines.push(`mov rdi, 1`);
-                nasmLines.push(`call calloc`);
+                nasmLines.push(`mov rdi, ${typeof instr.size === "number" ? instr.size : memRef(instr.size)}`);
+                nasmLines.push(`call lrt_arr_new`);                // zero-filled
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
-                if (typeof instr.size === "number") {
-                    nasmLines.push(`mov rax, ${memRef(instr.dst)}`);
-                    storeImm(`[rax]`, instr.size, "rcx");
-                } else {
-                    nasmLines.push(`mov rax, ${memRef(instr.dst)}`);
-                    nasmLines.push(`mov rcx, ${memRef(instr.size)}`);
-                    nasmLines.push(`mov [rax], rcx`);
-                }
                 break;
             }
 
             case "array_load": {
-                nasmLines.push(`mov rax, ${memRef(instr.arr)}`);  // rax = ptr
-
+                nasmLines.push(`mov rax, ${memRef(instr.arr)}`);  // rax = header
                 nasmLines.push(`mov rcx, [rax]`);                // rcx = length
                 boundsCheck(instr.index);
-
+                nasmLines.push(`mov rax, [rax + 16]`);           // rax = data
                 if (/^-?\d+$/.test(instr.index) && fitsDisp32(instr.index)) {
-                    const offset = 8 + Number(instr.index) * 8;
-                    nasmLines.push(`mov rax, [rax + ${offset}]`);
+                    nasmLines.push(`mov rax, [rax + ${Number(instr.index) * 8}]`);
                 } else {
                     nasmLines.push(`mov rdx, ${indexOperand(instr.index)}`);
-                    nasmLines.push(`imul rdx, 8`);
-                    nasmLines.push(`add rdx, 8`);
-                    nasmLines.push(`mov rax, [rax + rdx]`);
+                    nasmLines.push(`mov rax, [rax + rdx*8]`);
                 }
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                if (instr.is_string) stringTemps.add(instr.dst);
+                if (instr.is_float) floatVars.add(instr.dst);
                 break;
             }
 
             case "array_store": {
-                nasmLines.push(`mov rax, ${memRef(instr.arr)}`);  // rax = ptr
-
+                nasmLines.push(`mov rax, ${memRef(instr.arr)}`);  // rax = header
                 nasmLines.push(`mov rcx, [rax]`);                // rcx = length
                 boundsCheck(instr.index);
-
                 if(/^-?\d+$/.test(instr.src)) {
                     nasmLines.push(`mov r10, ${instr.src}`)
                 } else {
                     nasmLines.push(`mov r10, ${memRef(instr.src)}`)
                 }
-
+                nasmLines.push(`mov rax, [rax + 16]`);           // rax = data
                 if (/^-?\d+$/.test(instr.index) && fitsDisp32(instr.index)) {
-                    const offset = 8 + Number(instr.index) * 8;
-                    nasmLines.push(`mov [rax + ${offset}], r10`)
+                    nasmLines.push(`mov [rax + ${Number(instr.index) * 8}], r10`)
                 } else {
                     nasmLines.push(`mov rdx, ${indexOperand(instr.index)}`);
-                    nasmLines.push(`imul rdx, 8`);
-                    nasmLines.push(`add rdx, 8`);
-                    nasmLines.push(`mov [rax + rdx], r10`);
+                    nasmLines.push(`mov [rax + rdx*8], r10`);
                 }
                 break;
             }
 
             case "array_len": {
-                nasmLines.push(`mov rax, ${memRef(instr.arr)}`);  // rax = ptr
+                nasmLines.push(`mov rax, ${memRef(instr.arr)}`);  // rax = header
                 nasmLines.push(`mov rax, [rax]`);                  // rax = length
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+
+            // push/insert take the raw 8 bytes (float bits too); pop/remove hand back an element
+            case "array_push":
+            case "array_insert": {
+                const val = (x: string) => /^-?\d+$/.test(x) ? x : memRef(x);
+                nasmLines.push(`mov rdi, ${memRef(instr.arr)}`);
+                if (instr.op === "array_insert") {
+                    nasmLines.push(`mov rsi, ${val(instr.index)}`);
+                    nasmLines.push(`mov rdx, ${val(instr.src)}`);
+                    nasmLines.push(`call lrt_arr_insert`);
+                } else {
+                    nasmLines.push(`mov rsi, ${val(instr.src)}`);
+                    nasmLines.push(`call lrt_arr_push`);
+                }
+                break;
+            }
+            case "array_pop":
+            case "array_remove": {
+                nasmLines.push(`mov rdi, ${memRef(instr.arr)}`);
+                if (instr.op === "array_remove") {
+                    nasmLines.push(`mov rsi, ${/^-?\d+$/.test(instr.index) ? instr.index : memRef(instr.index)}`);
+                    nasmLines.push(`call lrt_arr_remove`);
+                } else {
+                    nasmLines.push(`call lrt_arr_pop`);
+                }
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                if (instr.is_string) stringTemps.add(instr.dst);
+                if (instr.is_float) floatVars.add(instr.dst);
                 break;
             }
 
@@ -330,6 +435,68 @@ export function emitNASM(instructions: IR[]): string {
                 nasmLines.push(`mov rsp, rbp`);
                 nasmLines.push(`pop rbp`);
                 nasmLines.push(`ret`);
+                break;
+            }
+            case "str_cmp": {
+                nasmLines.push(`mov rdi, ${memRef(instr.a)}`);
+                nasmLines.push(`mov rsi, ${memRef(instr.b)}`);
+                nasmLines.push(`call strcmp`);
+                nasmLines.push(`movsxd rax, eax`);          // strcmp returns a 32-bit int
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+            case "str_sub": {
+                // src[start..end] as a new string; start and end are clamped to 0..len
+                const n = strOpCount++;
+                const val = (x: string) => /^-?\d+$/.test(x) ? x : memRef(x);
+                const lenSlot = getSlot(`__strsub_len`), startSlot = getSlot(`__strsub_start`), endSlot = getSlot(`__strsub_end`);
+                nasmLines.push(`mov rdi, ${memRef(instr.src)}`);
+                nasmLines.push(`call strlen`);
+                nasmLines.push(`mov [rbp - ${lenSlot}], rax`);
+                nasmLines.push(`mov rax, ${val(instr.start)}`);
+                nasmLines.push(`mov rcx, ${val(instr.end)}`);
+                nasmLines.push(`xor rdx, rdx`);
+                nasmLines.push(`cmp rax, 0`);
+                nasmLines.push(`cmovl rax, rdx`);
+                nasmLines.push(`cmp rax, [rbp - ${lenSlot}]`);
+                nasmLines.push(`cmovg rax, [rbp - ${lenSlot}]`);
+                nasmLines.push(`cmp rcx, [rbp - ${lenSlot}]`);
+                nasmLines.push(`cmovg rcx, [rbp - ${lenSlot}]`);
+                nasmLines.push(`cmp rcx, rax`);
+                nasmLines.push(`cmovl rcx, rax`);
+                nasmLines.push(`mov [rbp - ${startSlot}], rax`);
+                nasmLines.push(`mov [rbp - ${endSlot}], rcx`);
+                nasmLines.push(`sub rcx, rax`);
+                nasmLines.push(`lea rdi, [rcx + 1]`);
+                nasmLines.push(`call malloc`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                nasmLines.push(`mov rdi, rax`);
+                nasmLines.push(`mov rsi, ${memRef(instr.src)}`);
+                nasmLines.push(`add rsi, [rbp - ${startSlot}]`);
+                nasmLines.push(`mov rdx, [rbp - ${endSlot}]`);
+                nasmLines.push(`sub rdx, [rbp - ${startSlot}]`);
+                nasmLines.push(`mov [rbp - ${lenSlot}], rdx`);
+                nasmLines.push(`call memcpy`);
+                nasmLines.push(`mov rax, ${memRef(instr.dst)}`);
+                nasmLines.push(`add rax, [rbp - ${lenSlot}]`);
+                nasmLines.push(`mov byte [rax], 0`);
+                stringTemps.add(instr.dst);
+                void n;
+                break;
+            }
+            case "type_layout":
+                break; // read before emitting
+            case "check_set": {
+                // a field that was never set: print the message and stop (see __unset_fail)
+                const n = strOpCount++;
+                const text = instr.message + "\n";
+                nasmLines.push(`cmp qword ${memRef(instr.src)}, 0`);
+                nasmLines.push(`jne __set_ok_${n}`);
+                nasmLines.push(`lea rsi, [rel ${getStringLabel(text)}]`);
+                nasmLines.push(`mov rdx, ${Buffer.byteLength(text, "utf8")}`);
+                nasmLines.push(`jmp __unset_fail`);
+                nasmLines.push(`__set_ok_${n}:`);
+                usesUnsetFail = true;
                 break;
             }
             case "str_eq": {
@@ -425,14 +592,30 @@ export function emitNASM(instructions: IR[]): string {
                     nasmLines.push(`lea rdi, [rel fmt_in]`);
                     nasmLines.push(`xor eax, eax`);
                     nasmLines.push(`call scanf`);
+                    nasmLines.push(`mov qword [rel __after_num], 1`)
                 } else if (instr.fn === "inputstr") {
-                    nasmLines.push(`mov rdi, 256`);
-                    nasmLines.push(`call malloc`);
-                    nasmLines.push(`mov ${memRef(instr.dst!)}, rax`);
-                    nasmLines.push(`mov rsi, rax`);
-                    nasmLines.push(`lea rdi, [rel fmt_str_in]`);
-                    nasmLines.push(`xor eax, eax`);
-                    nasmLines.push(`call scanf`);
+                    const n = inputCount++;
+                    const buf = memRef(instr.dst!);
+                    nasmLines.push(`mov rdi, 1`);
+                    nasmLines.push(`mov rsi, 256`);
+                    nasmLines.push(`call calloc`);                    // "" if nothing is read (EOF)
+                    nasmLines.push(`mov ${buf}, rax`);
+                    nasmLines.push(`__inputstr_read_${n}:`);
+                    nasmLines.push(`mov rdi, ${buf}`);
+                    nasmLines.push(`mov rsi, 256`);
+                    nasmLines.push(`mov rdx, [rel stdin]`);
+                    nasmLines.push(`call fgets`);
+                    nasmLines.push(`mov rdi, ${buf}`);
+                    nasmLines.push(`lea rsi, [rel nl_str]`);
+                    nasmLines.push(`call strcspn`);                   // index of the newline (or the end)
+                    nasmLines.push(`mov rcx, ${buf}`);
+                    nasmLines.push(`mov byte [rcx + rax], 0`);
+                    nasmLines.push(`cmp qword [rel __after_num], 0`);
+                    nasmLines.push(`mov qword [rel __after_num], 0`); // mov leaves the flags from cmp intact
+                    nasmLines.push(`je __inputstr_done_${n}`);
+                    nasmLines.push(`cmp byte [rcx], 0`);
+                    nasmLines.push(`je __inputstr_read_${n}`);        // only the rest of input()'s line: read again
+                    nasmLines.push(`__inputstr_done_${n}:`);
                     stringTemps.add(instr.dst!);
                 } else if (instr.fn === "len") {
                     nasmLines.push(`mov rdi, ${memRef(instr.args[0])}`);
@@ -448,6 +631,75 @@ export function emitNASM(instructions: IR[]): string {
                     nasmLines.push(`mov rdi, ${memRef(instr.args[0])}`);
                     nasmLines.push(`call atoi`);
                     nasmLines.push(`mov ${memRef(instr.dst!)}, rax`);
+                } else if (instr.fn === "chartostr") {
+                    // a one-character string
+                    nasmLines.push(`mov rdi, 2`);
+                    nasmLines.push(`mov rsi, 1`);
+                    nasmLines.push(`call calloc`);
+                    nasmLines.push(`mov ${memRef(instr.dst!)}, rax`);
+                    const arg = instr.args[0];
+                    nasmLines.push(`mov rcx, ${/^-?\d+$/.test(arg) ? arg : memRef(arg)}`);
+                    nasmLines.push(`mov [rax], cl`);
+                    stringTemps.add(instr.dst!);
+                } else if (instr.fn === "str_upper" || instr.fn === "str_lower") {
+                    // a copy with a-z / A-Z changed case
+                    const n = strOpCount++;
+                    const [from, to] = instr.fn === "str_upper" ? ["a", "z"] : ["A", "Z"];
+                    const delta = instr.fn === "str_upper" ? -32 : 32;
+                    nasmLines.push(`mov rdi, ${memRef(instr.args[0])}`);
+                    nasmLines.push(`call strlen`);
+                    nasmLines.push(`lea rdi, [rax + 1]`);
+                    nasmLines.push(`call malloc`);
+                    nasmLines.push(`mov ${memRef(instr.dst!)}, rax`);
+                    nasmLines.push(`mov rdi, rax`);
+                    nasmLines.push(`mov rsi, ${memRef(instr.args[0])}`);
+                    nasmLines.push(`call strcpy`);
+                    nasmLines.push(`mov rax, ${memRef(instr.dst!)}`);
+                    nasmLines.push(`__case_loop_${n}:`);
+                    nasmLines.push(`mov cl, [rax]`);
+                    nasmLines.push(`test cl, cl`);
+                    nasmLines.push(`jz __case_done_${n}`);
+                    nasmLines.push(`cmp cl, '${from}'`);
+                    nasmLines.push(`jl __case_next_${n}`);
+                    nasmLines.push(`cmp cl, '${to}'`);
+                    nasmLines.push(`jg __case_next_${n}`);
+                    nasmLines.push(`add cl, ${delta}`);
+                    nasmLines.push(`mov [rax], cl`);
+                    nasmLines.push(`__case_next_${n}:`);
+                    nasmLines.push(`inc rax`);
+                    nasmLines.push(`jmp __case_loop_${n}`);
+                    nasmLines.push(`__case_done_${n}:`);
+                    stringTemps.add(instr.dst!);
+                } else if (instr.fn === "str_find" || instr.fn === "str_contains") {
+                    // index of the first occurrence of args[1] in args[0] (-1 if none), or 1/0
+                    nasmLines.push(`mov rdi, ${memRef(instr.args[0])}`);
+                    nasmLines.push(`mov rsi, ${memRef(instr.args[1])}`);
+                    nasmLines.push(`call strstr`);
+                    if (instr.fn === "str_contains") {
+                        nasmLines.push(`test rax, rax`);
+                        nasmLines.push(`setnz al`);
+                        nasmLines.push(`movzx rax, al`);
+                    } else {
+                        nasmLines.push(`mov rcx, -1`);
+                        nasmLines.push(`test rax, rax`);
+                        nasmLines.push(`cmovz rax, rcx`);
+                        nasmLines.push(`jz __find_done_${strOpCount}`);
+                        nasmLines.push(`sub rax, ${memRef(instr.args[0])}`);
+                        nasmLines.push(`__find_done_${strOpCount++}:`);
+                    }
+                    nasmLines.push(`mov ${memRef(instr.dst!)}, rax`);
+                } else if (instr.fn === "floattostr") {
+                    // the float as text, formatted like print (%g)
+                    const arg = instr.args[0];
+                    nasmLines.push(`mov rdi, 32`);
+                    nasmLines.push(`call malloc`);
+                    nasmLines.push(`mov ${memRef(instr.dst!)}, rax`);
+                    nasmLines.push(`mov rdi, rax`);
+                    nasmLines.push(`lea rsi, [rel fmt_g]`);
+                    nasmLines.push(`movsd xmm0, ${memRef(arg)}`);
+                    nasmLines.push(`mov eax, 1`);
+                    nasmLines.push(`call sprintf`);
+                    stringTemps.add(instr.dst!);
                 } else if (instr.fn === "inttostr") {
                     const arg = loadOperand(instr.args[0]);
                     nasmLines.push(`mov rdi, 32`);
@@ -541,22 +793,32 @@ export function emitNASM(instructions: IR[]): string {
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 break;
             }
-            case "div": {
-                const a = loadOperand(instr.a);
-                const b = loadOperand(instr.b);
-                nasmLines.push(`mov rax, [rbp - ${a}]`);
-                nasmLines.push(`cqo`);
-                nasmLines.push(`idiv qword [rbp - ${b}]`);
-                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
-                break;
-            }
+            case "div":
             case "mod": {
+                // x / 0 stops with an error; x / -1 is a negation (idiv traps on INT64_MIN / -1)
                 const a = loadOperand(instr.a);
                 const b = loadOperand(instr.b);
+                const n = strOpCount++;
+                const text = "Error: division by zero\n";
+                nasmLines.push(`mov rcx, [rbp - ${b}]`);
+                nasmLines.push(`test rcx, rcx`);
+                nasmLines.push(`jnz __div_ok_${n}`);
+                nasmLines.push(`lea rsi, [rel ${getStringLabel(text)}]`);
+                nasmLines.push(`mov rdx, ${Buffer.byteLength(text, "utf8")}`);
+                nasmLines.push(`jmp __unset_fail`);
+                usesUnsetFail = true;
+                nasmLines.push(`__div_ok_${n}:`);
                 nasmLines.push(`mov rax, [rbp - ${a}]`);
+                nasmLines.push(`cmp rcx, -1`);
+                nasmLines.push(`jne __div_normal_${n}`);
+                nasmLines.push(instr.op === "div" ? `neg rax` : `xor eax, eax`);
+                nasmLines.push(`jmp __div_done_${n}`);
+                nasmLines.push(`__div_normal_${n}:`);
                 nasmLines.push(`cqo`);
-                nasmLines.push(`idiv qword [rbp - ${b}]`);
-                nasmLines.push(`mov ${memRef(instr.dst)}, rdx`);
+                nasmLines.push(`idiv rcx`);
+                if (instr.op === "mod") nasmLines.push(`mov rax, rdx`);
+                nasmLines.push(`__div_done_${n}:`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 break;
             }
             case "and": {
@@ -704,44 +966,41 @@ export function emitNASM(instructions: IR[]): string {
                 break;
             }
             case "alloc": {
-                nasmLines.push(`mov rdi, ${instr.size}`);
-                nasmLines.push(`call malloc`);
-                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                nasmLines.push(`mov rdi, 1`);
+                nasmLines.push(`mov rsi, ${instr.size}`);
+                nasmLines.push(`call calloc`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`)
                 break;
             }
             case "free": {
-                nasmLines.push(`mov rdi, ${memRef(instr.addr)}`);
-                nasmLines.push(`call free`);
+                if (needsDeepFree(instr.type)) {
+                    nasmLines.push(`mov rdi, ${memRef(instr.addr)}`)
+                    nasmLines.push(`call ${freeFn(instr.type)}`)
+                    break;
+                }
+                if(instr.fields?.length) {
+                    const skip = `__free_skip_${freeSkipCount++}`
+                    nasmLines.push(`cmp qword ${memRef(instr.addr)}, 0`)
+                    nasmLines.push(`je ${skip}`)
+                    for (const off of instr.fields) {
+                        nasmLines.push(`mov rax, ${memRef(instr.addr)}`)
+                        nasmLines.push(`mov rdi, [rax + ${off}]`)
+                        nasmLines.push(`call free`)
+                    }
+                    nasmLines.push(`mov rdi, ${memRef(instr.addr)}`)
+                    nasmLines.push(`call free`)
+                    nasmLines.push(`${skip}:`)
+                    break;
+                }
+                nasmLines.push(`mov rdi, ${memRef(instr.addr)}`)
+                nasmLines.push(`call free`)
                 break;
             }
             case "array_free_2d": {
-                const idxSlot = getSlot(`__free2d_idx_${instr.arr}`);
-                const loopLabel = `__free2d_loop_${instr.arr}_${stackOffset}`;
-                const endLabel  = `__free2d_end_${instr.arr}_${stackOffset}`;
-                // a NULL array (never allocated on this path) has no rows to free
-                nasmLines.push(`cmp qword ${memRef(instr.arr)}, 0`);
-                nasmLines.push(`je ${endLabel}`);
-                nasmLines.push(`mov qword [rbp - ${idxSlot}], 0`);
-                nasmLines.push(`${loopLabel}:`);
-                const rowsVal = instr.rows;
-                if (typeof rowsVal === "number" || /^-?\d+$/.test(String(rowsVal))) {
-                    nasmLines.push(`cmp qword [rbp - ${idxSlot}], ${rowsVal}`);
-                } else {
-                    nasmLines.push(`mov rax, ${memRef(String(rowsVal))}`);
-                    nasmLines.push(`cmp qword [rbp - ${idxSlot}], rax`);
-                }
-                nasmLines.push(`jge ${endLabel}`);
-                nasmLines.push(`mov rax, ${memRef(instr.arr)}`);
-                nasmLines.push(`mov rcx, [rbp - ${idxSlot}]`);
-                nasmLines.push(`imul rcx, 8`);
-                nasmLines.push(`add rcx, 8`);
-                nasmLines.push(`mov rdi, [rax + rcx]`);
-                nasmLines.push(`call free`);
-                nasmLines.push(`add qword [rbp - ${idxSlot}], 1`);
-                nasmLines.push(`jmp ${loopLabel}`);
-                nasmLines.push(`${endLabel}:`);
+                // an int[][] whose type wasn't recorded: free its rows, then it
                 nasmLines.push(`mov rdi, ${memRef(instr.arr)}`);
-                nasmLines.push(`call free`);
+                nasmLines.push(`lea rsi, [rel ${freeFn("int[]")}]`);
+                nasmLines.push(`call lrt_arr_free`);
                 break;
             }
             case "lea": {
@@ -832,6 +1091,18 @@ export function emitNASM(instructions: IR[]): string {
                 nasmLines.push(`nop`);
                 break;
             }
+            case "str_dup": {
+                stringTemps.add(instr.dst);
+                nasmLines.push(`mov rdi, ${memRef(instr.src)}`);
+                nasmLines.push(`call strlen`);
+                nasmLines.push(`lea rdi, [rax + 1]`);
+                nasmLines.push(`call malloc`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                nasmLines.push(`mov rdi, rax`);
+                nasmLines.push(`mov rsi, ${memRef(instr.src)}`);
+                nasmLines.push(`call strcpy`);
+                break;
+            }
             case "str_concat": {
                 stringTemps.add(instr.dst);
                 // allocate strlen(a) + strlen(b) + 1 bytes
@@ -855,9 +1126,10 @@ export function emitNASM(instructions: IR[]): string {
             }
             case "struct_alloc": {
                 const size = instr.numFields * 8;
-                nasmLines.push(`mov rdi, ${size}`);
-                nasmLines.push(`call malloc`);
-                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                nasmLines.push(`mov rdi, 1`);
+                nasmLines.push(`mov rsi, ${size}`);
+                nasmLines.push(`call calloc`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`)
                 break;
             }
             case "field_store": {
@@ -875,21 +1147,101 @@ export function emitNASM(instructions: IR[]): string {
                 nasmLines.push(`mov rax, [rax + ${instr.offset}]`);
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 if (instr.is_string) stringTemps.add(instr.dst);
+                if (instr.is_float) floatVars.add(instr.dst);
+                break;
+            }
+            // maps (Typescript/runtime/lrt.c): keys and values travel as their raw 8 bytes
+            case "map_new": {
+                nasmLines.push(`mov rdi, ${instr.stringKeys ? 1 : 0}`);
+                nasmLines.push(`call lrt_map_new`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+            case "map_set": {
+                const val = (x: string) => /^-?\d+$/.test(x) ? x : memRef(x);
+                nasmLines.push(`mov rdi, ${memRef(instr.map)}`);
+                nasmLines.push(`mov rsi, ${val(instr.key)}`);
+                nasmLines.push(`mov rdx, ${val(instr.src)}`);
+                nasmLines.push(`call lrt_map_set`);                // returns the value it replaced (or 0)
+                if (instr.valType && isHeapElem(instr.valType)) {
+                    nasmLines.push(`mov rdi, rax`);
+                    nasmLines.push(`call ${freeFn(instr.valType)}`);
+                }
+                break;
+            }
+            case "map_get":
+            case "map_has": {
+                nasmLines.push(`mov rdi, ${memRef(instr.map)}`);
+                nasmLines.push(`mov rsi, ${/^-?\d+$/.test(instr.key) ? instr.key : memRef(instr.key)}`);
+                nasmLines.push(`call ${instr.op === "map_get" ? "lrt_map_get" : "lrt_map_has"}`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                if (instr.op === "map_get" && instr.is_string) stringTemps.add(instr.dst);
+                if (instr.op === "map_get" && instr.is_float) floatVars.add(instr.dst);
+                break;
+            }
+            case "map_remove": {
+                nasmLines.push(`mov rdi, ${memRef(instr.map)}`);
+                nasmLines.push(`mov rsi, ${/^-?\d+$/.test(instr.key) ? instr.key : memRef(instr.key)}`);
+                nasmLines.push(`call lrt_map_remove`);             // returns the removed value (or 0)
+                if (instr.valType && isHeapElem(instr.valType)) {
+                    nasmLines.push(`mov rdi, rax`);
+                    nasmLines.push(`call ${freeFn(instr.valType)}`);
+                }
+                break;
+            }
+            case "map_keys":
+            case "map_len": {
+                nasmLines.push(`mov rdi, ${memRef(instr.map)}`);
+                nasmLines.push(`call ${instr.op === "map_keys" ? "lrt_map_keys" : "lrt_map_len"}`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+            case "func_addr": {
+                nasmLines.push(`lea rax, [rel $${instr.fn}]`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+            case "call_indirect": {
+                // call the function whose address is in `target` (r11: rax carries the float-arg count)
+                nasmLines.push(`mov r11, ${memRef(instr.target)}`);
+                let xmm = 0, gp = 0;
+                instr.args.forEach(arg => {
+                    if (floatVars.has(arg)) nasmLines.push(`movsd xmm${xmm++}, ${memRef(arg)}`);
+                    else if (/^-?\d+$/.test(arg)) nasmLines.push(`mov ${sysv[gp++]}, ${arg}`);
+                    else nasmLines.push(`mov ${sysv[gp++]}, ${memRef(arg)}`);
+                });
+                nasmLines.push(xmm > 0 ? `mov eax, ${xmm}` : `xor eax, eax`);
+                nasmLines.push(`call r11`);
+                if (instr.returns_float) {
+                    nasmLines.push(`movsd ${memRef(instr.dst)}, xmm0`);
+                    floatVars.add(instr.dst);
+                } else {
+                    nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                }
+                if (instr.returns_string) stringTemps.add(instr.dst);
                 break;
             }
             case "vtable_call": {
-                nasmLines.push(`mov rax, ${memRef(instr.base)}`);
-                nasmLines.push(`mov rax, [rax]`);
-                nasmLines.push(`mov rax, [rax + ${instr.slot * 8}]`);
-                instr.args.forEach((arg, i) => {
-                    if (/^-?\d+$/.test(arg)) {
-                        nasmLines.push(`mov ${sysv[i]}, ${arg}`);
-                    } else {
-                        nasmLines.push(`mov ${sysv[i]}, ${memRef(arg)}`);
-                    }
+                // the method's address goes in r11 (rax carries the count of float args); float
+                // args go in xmm registers, the rest (starting with the receiver) in integer ones
+                nasmLines.push(`mov r11, ${memRef(instr.base)}`);
+                nasmLines.push(`mov r11, [r11]`);
+                nasmLines.push(`mov r11, [r11 + ${instr.slot * 8}]`);
+                let xmm = 0, gp = 0;
+                instr.args.forEach(arg => {
+                    if (floatVars.has(arg)) nasmLines.push(`movsd xmm${xmm++}, ${memRef(arg)}`);
+                    else if (/^-?\d+$/.test(arg)) nasmLines.push(`mov ${sysv[gp++]}, ${arg}`);
+                    else nasmLines.push(`mov ${sysv[gp++]}, ${memRef(arg)}`);
                 });
-                nasmLines.push(`call rax`);
-                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                nasmLines.push(xmm > 0 ? `mov eax, ${xmm}` : `xor eax, eax`);
+                nasmLines.push(`call r11`);
+                if (instr.returns_float) {
+                    nasmLines.push(`movsd ${memRef(instr.dst)}, xmm0`);
+                    floatVars.add(instr.dst);
+                } else {
+                    nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                }
+                if (instr.returns_string) stringTemps.add(instr.dst);
                 break;
             }
             case "vtable_ptr": {
@@ -902,15 +1254,54 @@ export function emitNASM(instructions: IR[]): string {
         }
     }
 
+    // every struct with a vtable frees itself through slot 0 (see the vtable_entry "__free")
+    for (const s of dynamicStructs) {
+        nasmLines.push(...emitFreeRoutine(s, `__freeobj_${s}`));
+    }
+    // free routines for the types used above (a routine may need others, so repeat until done)
+    const emittedFrees = new Set<string>();
+    while ([...neededFrees].some(t => !emittedFrees.has(t))) {
+        for (const t of [...neededFrees]) {
+            if (emittedFrees.has(t)) continue;
+            emittedFrees.add(t);
+            nasmLines.push(...emitFreeRoutine(t));
+        }
+    }
+
+    if (usesFreeDyn) {
+        // free a struct that has a vtable: jump to the free routine in its slot 0 (NULL is skipped)
+        nasmLines.push(`__free_dyn:`);
+        nasmLines.push(`test rdi, rdi`);
+        nasmLines.push(`jz .done`);
+        nasmLines.push(`mov rax, [rdi]`);
+        nasmLines.push(`jmp [rax]`);
+        nasmLines.push(`.done:`);
+        nasmLines.push(`ret`);
+    }
+
+    {
+        // a runtime error (a field never set, division by zero): rsi = message, rdx = its length.
+        // Flush what the program printed, write the message to stderr and exit with status 1
+        nasmLines.push(`__unset_fail:`);
+        nasmLines.push(`and rsp, -16`);
+        nasmLines.push(`push rdx`);
+        nasmLines.push(`push rsi`);
+        nasmLines.push(`xor edi, edi`);
+        nasmLines.push(`call fflush`);
+        nasmLines.push(`pop rsi`);
+        nasmLines.push(`pop rdx`);
+        nasmLines.push(`mov rdi, 2`);
+        nasmLines.push(`mov rax, 1`);
+        nasmLines.push(`syscall`);
+        nasmLines.push(`mov edi, 1`);
+        nasmLines.push(`call exit`);
+    }
+
+    // an index outside the array: the same runtime error path as the others
     nasmLines.push(`_bounds_fail:`);
-    nasmLines.push(`mov rdi, 1`);
-    nasmLines.push(`mov rsi, bounds_msg`);
+    nasmLines.push(`lea rsi, [rel bounds_msg]`);
     nasmLines.push(`mov rdx, 27`);
-    nasmLines.push(`mov rax, 1`);
-    nasmLines.push(`syscall`);
-    nasmLines.push(`mov rdi, 1`);
-    nasmLines.push(`mov rax, 60`);
-    nasmLines.push(`syscall`);  
+    nasmLines.push(`jmp __unset_fail`);
 
     if (stringLiterals.size > 0) {
         const dataLines: string[] = [];
@@ -951,6 +1342,7 @@ export function emitNASM(instructions: IR[]): string {
     if (globalVars.size > 0) {
         nasmLines.push("");
         nasmLines.push("section .bss");
+        nasmLines.push("alignb 8")
         for (const name of globalVars) {
             nasmLines.push(`__g_${name}: resq 1`);
         }

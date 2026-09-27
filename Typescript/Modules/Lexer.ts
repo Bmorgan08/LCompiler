@@ -8,6 +8,9 @@ export function Lexer(src: string): string[] {
     return LexerWithPos(src).map(t => t.value);
 }
 
+// \n \t \r \\ \" \' \0 in string and char literals
+const ESCAPES: Record<string, string> = { n: "\n", t: "\t", r: "\r", "\\": "\\", '"': '"', "'": "'", "0": "\0" };
+
 export function LexerWithPos(src: string): Token[] {
     const tokens: Token[] = [];
     let line = 1;
@@ -105,19 +108,35 @@ export function LexerWithPos(src: string): Token[] {
         } else if (c === "." && src[i + 1] === ".") {
             tokens.push({ value: "..", line: startLine, col: startCol });
             i++; col += 2;
+        } else if (c === "'" && src[i + 1] === "\\" && src[i + 3] === "'") {
+            // an escaped char: '\n'
+            const e = ESCAPES[src[i + 2]];
+            if (e === undefined) throw new Error(`${startLine}:${startCol}: Unknown escape '\\${src[i + 2]}'`);
+            tokens.push({ value: `'${e}'`, line: startLine, col: startCol });
+            i += 3; col += 4;
         } else if (c === "'" && i + 2 < src.length && src[i + 2] === "'") {
             tokens.push({ value: `'${src[i + 1]}'`, line: startLine, col: startCol });
             i += 2; col += 3;
         } else if (c === '"') {
+            // the token holds the decoded text between the quotes
             let str = '"';
-            i++;
+            i++; col++;
             while (i < src.length && src[i] !== '"') {
-                if (src[i] === '\n') { line++; col = 1; }
+                if (src[i] === "\\") {
+                    const e = ESCAPES[src[i + 1]];
+                    if (e === undefined) throw new Error(`${line}:${col}: Unknown escape '\\${src[i + 1] ?? ""}'`);
+                    str += e;
+                    i += 2; col += 2;
+                    continue;
+                }
+                if (src[i] === '\n') { line++; col = 0; }
                 str += src[i++];
+                col++;
             }
+            if (i >= src.length) throw new Error(`${startLine}:${startCol}: Unterminated string`);
             str += '"';
             tokens.push({ value: str, line: startLine, col: startCol });
-            col += str.length;
+            col++;
         } else {
             tokens.push({ value: c, line: startLine, col: startCol });
             col++;

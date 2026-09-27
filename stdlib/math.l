@@ -166,15 +166,46 @@ function math_ln(float x) {
 } 
 
 function math_pow(float base, float exp) {
-    var float lnbase = math_ln(base);
-    var float t = exp * lnbase;
-    var float u2 = t * t;
-    var float u3 = u2 * t;
-    var float u4 = u3 * t;
-    var float u5 = u4 * t;
-    var float u6 = u5 * t;
-    var float u7 = u6 * t;
-    return 1.0 + t + u2*0.5 + u3*0.1666666667 + u4*0.0416666667 + u5*0.0083333333 + u6*0.0013888889 + u7*0.0001984127;
+    // a whole-number exponent is multiplied out (exact, and works for base <= 0)
+    var int n = math_toint(exp);
+    if (math_tofloat(n) == exp) {
+        var float result = 1.0;
+        var float b = base;
+        var int k = math_abs(n);
+        while (k > 0) {
+            if (k % 2 == 1) { result = result * b; }
+            b = b * b;
+            k = k / 2;
+        }
+        if (n < 0) { return 1.0 / result; }
+        return result;
+    }
+    return math_exp(exp * math_ln(base));
 }
+
+function math_exp(float t) {
+    // e^t = e^whole * e^frac with frac in [0, 1), where the series converges quickly
+    var int whole = math_floor(t);
+    var float frac = t - math_tofloat(whole);
+    var float term = 1.0;
+    var float sum = 1.0;
+    var int i = 1;
+    while (i < 18) {
+        term = term * frac / math_tofloat(i);
+        sum = sum + term;
+        i++;
+    }
+    var float scale = 1.0;
+    var float e = 2.718281828459045;
+    var int k = math_abs(whole);
+    while (k > 0) {
+        if (k % 2 == 1) { scale = scale * e; }
+        e = e * e;
+        k = k / 2;
+    }
+    if (whole < 0) { return sum / scale; }
+    return sum * scale;
+}
+
 
 

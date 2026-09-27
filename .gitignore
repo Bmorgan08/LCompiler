@@ -1,6 +1,22 @@
 node_modules/
 dist/
-output/
-output.asm
-_test.asm
 *.js.map
+
+# compiler output: binaries (default name 'output') and their assembly/objects
+output
+*.asm
+*.o
+!Typescript/runtime/graphics.o
+
+# the L runtime, built from Typescript/runtime/lrt.c on first compile (covered by *.o above),
+# and its temporary file if a build is interrupted
+Typescript/runtime/lrt.o.*.tmp
+
+# ramanujan.l capability test (local only) and its binary
+/ramanujan
+/ramanujan.l
+
+# crash dumps from valgrind and the kernel (memory-checking runs can leave these)
+vgcore.*
+core
+core.[0-9]*

@@ -2,6 +2,10 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const node_1 = require("vscode-languageserver/node");
 const vscode_languageserver_textdocument_1 = require("vscode-languageserver-textdocument");
+const child_process_1 = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const url_1 = require("url");
 const connection = (0, node_1.createConnection)(node_1.ProposedFeatures.all);
 const documents = new node_1.TextDocuments(vscode_languageserver_textdocument_1.TextDocument);
 function createScope(parent) {
@@ -704,8 +708,20 @@ function makeBuiltins() {
         { name: "input", kind: "func", params: 0, detail: "input() → int — reads an integer from stdin" },
         { name: "inputstr", kind: "func", params: 0, detail: "inputstr() → string — reads a string from stdin" },
         { name: "len", kind: "func", params: 1, detail: "len(s) → int — length of a string" },
+        { name: "floattostr", kind: "func", params: 1, detail: "floattostr(f) → string — convert float to string" },
+        { name: "str_split", kind: "func", params: 2, detail: "str_split(s, sep) → string[] — the pieces of s between each sep" },
+        { name: "str_join", kind: "func", params: 2, detail: "str_join(parts, sep) → string — parts joined with sep" },
+        { name: "str_trim", kind: "func", params: 1, detail: "str_trim(s) → string — s without surrounding whitespace" },
+        { name: "str_replace", kind: "func", params: 3, detail: "str_replace(s, from, to) → string — every from replaced by to" },
+        { name: "strtofloat", kind: "func", params: 1, detail: "strtofloat(s) → float — parse string to float" },
+        { name: "str_is_space", kind: "func", params: 1, detail: "str_is_space(c) → bool — space, tab, newline or carriage return" },
         { name: "strtoint", kind: "func", params: 1, detail: "strtoint(s) → int — parse string to int" },
         { name: "inttostr", kind: "func", params: 1, detail: "inttostr(n) → string — convert int to string" },
+        { name: "chartostr", kind: "func", params: 1, detail: "chartostr(c) → string — one-character string" },
+        { name: "str_find", kind: "func", params: 2, detail: "str_find(s, part) → int — index of part in s, or -1" },
+        { name: "str_contains", kind: "func", params: 2, detail: "str_contains(s, part) → int — 1 if part occurs in s" },
+        { name: "str_upper", kind: "func", params: 1, detail: "str_upper(s) → string — copy in uppercase" },
+        { name: "str_lower", kind: "func", params: 1, detail: "str_lower(s) → string — copy in lowercase" },
         { name: "print_string", kind: "func", params: 1, detail: "print_string(s) — print a string" },
         { name: "print_int", kind: "func", params: 1, detail: "print_int(n) — print an integer" },
         { name: "ord", kind: "func", params: 1, detail: "ord(c) → int — get ASCII code of char" },
@@ -972,16 +988,63 @@ function getScopeAtPosition(ast, line, source, globalScope) {
 }
 // ─── Per-document cache ───────────────────────────────────────────────────────
 const docCache = new Map();
+// the compiler's error for each document from its last save (see checkWithCompiler)
+const compilerDiagnostics = new Map();
+// The quick checks in analyzeDocument use their own small parser, which doesn't know all of the
+// language and reports false errors; when the compiler is built its errors are shown instead, and
+// the quick parse is only used for completions and hovers.
+function publishDiagnostics(uri) {
+    const diagnostics = fs.existsSync(COMPILER) ? (compilerDiagnostics.get(uri) ?? []) : (docCache.get(uri)?.errors ?? []);
+    connection.sendDiagnostics({ uri, diagnostics });
+}
 function refreshDocument(doc) {
     const result = analyzeDocument(doc.getText());
     docCache.set(doc.uri, result);
-    connection.sendDiagnostics({ uri: doc.uri, diagnostics: result.errors });
+    publishDiagnostics(doc.uri);
+}
+// ─── Compiler check on save ──────────────────────────────────────────────────
+// The quick checks above only cover part of the language, so on save the real compiler runs
+// (`node dist/Main.js <file> --check`: parse, type and memory-safety checks, no output files) and
+// its error, "Error: line:col: message", is shown until the next save.
+const COMPILER = path.resolve(__dirname, "..", "..", "dist", "Main.js");
+const running = new Map();   // uri -> the check in progress, killed if the file is saved again
+function parseCompilerError(stderr) {
+    const text = stderr.trim().replace(/^Error:\s*/, "");
+    if (!text) return [];
+    const m = /^(\d+):(\d+):\s*([\s\S]*)$/.exec(text);
+    const line = m ? Math.max(0, Number(m[1]) - 1) : 0;
+    const col = m ? Math.max(0, Number(m[2]) - 1) : 0;
+    return [{
+        range: node_1.Range.create(line, col, line, col + 1),
+        message: m ? m[3] : text,
+        severity: node_1.DiagnosticSeverity.Error,
+        source: "L compiler",
+    }];
+}
+function checkWithCompiler(doc) {
+    if (!fs.existsSync(COMPILER)) return;   // the compiler hasn't been built (npx tsc)
+    let file;
+    try {
+        file = (0, url_1.fileURLToPath)(doc.uri);
+    } catch {
+        return;   // not a file on disk
+    }
+    running.get(doc.uri)?.kill();
+    const child = (0, child_process_1.execFile)(process.execPath, [COMPILER, file, "--check"],
+        { cwd: path.dirname(file), timeout: 30000 }, (error, _stdout, stderr) => {
+        if (running.get(doc.uri) !== child) return;   // a newer save replaced this check
+        running.delete(doc.uri);
+        if (error?.killed) return;
+        compilerDiagnostics.set(doc.uri, error ? parseCompilerError(stderr) : []);
+        publishDiagnostics(doc.uri);
+    });
+    running.set(doc.uri, child);
 }
 // ─── LSP lifecycle ───────────────────────────────────────────────────────────
 connection.onInitialize((params) => {
     return {
         capabilities: {
-            textDocumentSync: node_1.TextDocumentSyncKind.Incremental,
+            textDocumentSync: { openClose: true, change: node_1.TextDocumentSyncKind.Incremental, save: { includeText: false } },
             completionProvider: { resolveProvider: true, triggerCharacters: ["."] },
             hoverProvider: true,
         },
@@ -992,6 +1055,17 @@ documents.onDidChangeContent((change) => {
 });
 documents.onDidOpen((e) => {
     refreshDocument(e.document);
+    checkWithCompiler(e.document);
+});
+documents.onDidSave((e) => {
+    checkWithCompiler(e.document);
+});
+documents.onDidClose((e) => {
+    running.get(e.document.uri)?.kill();
+    running.delete(e.document.uri);
+    compilerDiagnostics.delete(e.document.uri);
+    docCache.delete(e.document.uri);
+    connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
 });
 // ─── Completion ───────────────────────────────────────────────────────────────
 connection.onCompletion((params) => {
@@ -1029,6 +1103,21 @@ connection.onCompletion((params) => {
                 }));
             }
         }
+        // arrays and maps: declared as `var int[] xs`, `var map<string, int> m`, or a parameter
+        const method = (name, detail) => items.push({ label: name, kind: node_1.CompletionItemKind.Method, detail, insertText: `${name}(` });
+        if (items.length === 0 && new RegExp(`\\bmap\\s*<[^;{]*>\\s+${varName}\\b`).test(text)) {
+            method("has", "has(key) → int — 1 if key is in the map");
+            method("remove", "remove(key) — removes key and its value");
+            method("len", "len() → int — number of keys");
+            method("keys", "keys() → K[] — a new array of the keys");
+        }
+        else if (items.length === 0 && new RegExp(`(\\[\\]\\s+${varName}\\b|\\b${varName}\\s*=\\s*\\[)`).test(text)) {
+            method("len", "len() → int — number of elements");
+            method("push", "push(v) — adds v at the end");
+            method("pop", "pop() → T — removes and returns the last element");
+            method("insert", "insert(i, v) — inserts v before index i");
+            method("remove", "remove(i) → T — removes and returns element i");
+        }
         if (items.length > 0)
             return items;
         // Fall through to general completions if no struct found
@@ -1050,12 +1139,12 @@ connection.onCompletion((params) => {
         }
     });
     // Keywords
-    const keywords = ["var", "function", "fn", "struct", "return", "if", "else", "while", "for", "match", "break", "continue", "new", "extends", "overrides", "this", "const", "main", "in"];
+    const keywords = ["var", "function", "fn", "struct", "return", "if", "else", "while", "for", "match", "break", "continue", "new", "extends", "overrides", "this", "const", "main", "in", "let", "import", "asm"];
     keywords.forEach(k => items.push({ label: k, kind: node_1.CompletionItemKind.Keyword }));
     // Types
-    ["int", "bool", "float", "string", "char", "void"].forEach(t => items.push({ label: t, kind: node_1.CompletionItemKind.TypeParameter }));
+    ["int", "bool", "float", "string", "char", "void", "map"].forEach(t => items.push({ label: t, kind: node_1.CompletionItemKind.TypeParameter }));
     // Boolean literals
-    ["true", "false"].forEach(k => items.push({ label: k, kind: node_1.CompletionItemKind.Keyword }));
+    ["true", "false", "none"].forEach(k => items.push({ label: k, kind: node_1.CompletionItemKind.Keyword }));
     return items;
 });
 connection.onCompletionResolve((item) => item);
@@ -1092,7 +1181,7 @@ connection.onHover((params) => {
     if (builtin)
         return { contents: { kind: node_1.MarkupKind.Markdown, value: `**builtin** \`${builtin.detail}\`` } };
     // Check types
-    const typeInfo = { int: "integer type", bool: "boolean type", float: "floating-point type", string: "string type", char: "single byte character type", void: "void type", true: "boolean literal true", false: "boolean literal false" };
+    const typeInfo = { int: "integer type", bool: "boolean type", float: "floating-point type", string: "string type", char: "single byte character type", void: "void type", true: "boolean literal true", false: "boolean literal false", map: "map<K, V> — values of type V stored under keys of type K", none: "none — an empty string, array, struct or map field" };
     if (typeInfo[word])
         return { contents: { kind: node_1.MarkupKind.Markdown, value: `**type** \`${word}\` — ${typeInfo[word]}` } };
     return null;

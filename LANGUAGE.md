@@ -17,15 +17,18 @@ L is a compiled, statically-typed language that produces native Linux binaries. 
 9. [Strings](#strings)
 10. [Chars](#chars)
 11. [Tuples](#tuples)
-12. [Structs](#structs)
-13. [Imports](#imports)
-14. [Inline Assembly](#inline-assembly)
-15. [Built-ins](#built-ins)
-16. [Standard Library](#standard-library)
+12. [Maps](#maps)
+13. [Structs](#structs)
+14. [Imports](#imports)
+15. [Inline Assembly](#inline-assembly)
+16. [Built-ins](#built-ins)
+17. [Standard Library](#standard-library)
     - [math](#math)
     - [graphics](#graphics)
-17. [Full Example](#full-example)
-18. [Nerd Talk](#nerd-talk)
+    - [string](#string)
+18. [Runtime Errors](#runtime-errors)
+19. [Full Example](#full-example)
+20. [Nerd Talk](#nerd-talk)
 
 ---
 
@@ -47,8 +50,9 @@ node dist/Main.js hello.l hello    # compiles to ./hello
 | `--asm`     | Print the generated assembly           |
 | `--tokens`  | Print the token stream                 |
 | `--verbose` | Print all of the above                 |
+| `--check`   | Only check the program: report the first error and exit 1, or exit 0; no files are written |
 
-Errors include the source location: `line:col: message`.
+Errors include the source location: `line:col: message`. The VS Code extension runs `--check` whenever a file is opened or saved and shows the error in the editor.
 
 ---
 
@@ -81,9 +85,13 @@ main() {
 | `int[]`    | 1-D array of integers                         |
 | `float[]`  | 1-D array of floats                           |
 | `char[]`   | 1-D array of chars                            |
-| `int[][]`  | 2-D array of integers                         |
+| `string[]` | 1-D array of strings                          |
+| `P[]`      | 1-D array of structs of type `P`              |
+| `int[][]`, `float[][]` | 2-D array of numbers              |
+| `map<K, V>` | Keys of type `K` mapped to values of type `V` (see [Maps](#maps)) |
+| `fn(A, B): R` | A function taking `A` and `B` and returning `R` (see [Functions as Values](#functions-as-values)) |
 
-Struct types are named with a capital letter by convention (`Point`, `Player`, `Node`).
+Struct types are named with a capital letter by convention (`Point`, `Player`, `Node`). A tuple's type is written as its element types in parentheses, e.g. `(string, int)` (see [Tuples](#tuples)).
 
 ### Implicit Conversions
 
@@ -95,6 +103,27 @@ var int n = 9.9;      // float 9.9 → int 9 (truncated)
 ```
 
 `bool` and `int` are interchangeable — any non-zero int is truthy.
+
+In an expression, `int`, `float`, `char` and `bool` mix freely. If either side is a `float`, the other side is converted and the result is a `float`:
+
+```
+var f = 1.5;
+var n = 2;
+print(f + n);     // 3.5
+print(f < 0);     // 0 — the int 0 is compared as 0.0
+```
+
+Other combinations are a compile error:
+
+| Not allowed                         | Why                                               |
+|-------------------------------------|---------------------------------------------------|
+| `"a" + 1`, `"a" == 1`, `"a" < 1`    | strings only join (`+`) and compare (`==`, `!=`, `<`, `>`, …) with strings |
+| `5.5 % 2`                           | `%` needs whole numbers — use `math_fmod`         |
+| `arr + 1`                           | arrays can't be used in arithmetic                |
+
+When one side's type isn't known at compile time (for example the result of some function calls), the check is skipped.
+
+The same rules apply to compound assignment: `f += n` converts the int `n`, and `n += 1.9` on an int `n` truncates the result back to an int, just like `n = n + 1.9`.
 
 ---
 
@@ -115,7 +144,14 @@ var s = "hi";      // inferred as string
 var f = 1.5;       // inferred as float
 ```
 
-`let` and `const` are accepted as aliases for `var` — the language does not enforce immutability on `const` variables yet.
+`let` is an alias for `var`. A variable declared with `const` can't be reassigned — `=`, `+=`, `++` and the rest are compile errors:
+
+```
+const int LIMIT = 10;
+LIMIT = 11;           // error: Cannot assign to const variable 'LIMIT'
+```
+
+`const` fixes the variable, not what it points to: the elements of a `const` array and the fields of a `const` struct can still be changed.
 
 Integer literals can be written in hexadecimal with a `0x` prefix:
 
@@ -135,6 +171,8 @@ x + y    x - y    x * y    x / y    x % y
 ```
 
 `%` is integer modulo. For float modulo use `math_fmod` from the standard library.
+
+Integer `/` and `%` round toward zero (`-7 / 2` is `-3`, `-7 % 3` is `-1`). Dividing an integer by zero stops the program with `Error: division by zero` (see [Runtime Errors](#runtime-errors)). Float division by zero follows IEEE 754 and gives `inf` or `nan`.
 
 ### Compound Assignment
 
@@ -215,6 +253,8 @@ for (n in nums) {
 }
 ```
 
+The source can be any expression that gives an array, such as a call: `for (w in str_split(line, " ")) { ... }`. Looping over a [map](#maps) visits its keys.
+
 ### Break / Continue
 
 ```
@@ -249,7 +289,51 @@ function greet(string name) {
 }
 ```
 
-Parameters must be typed. The return type is inferred from the `return` statements in the body. `function` and `fn` are both accepted.
+Parameters must be typed. `function` and `fn` are both accepted.
+
+The return type can be written after the parameters with `:`. Without it, the return type is inferred from the `return` statements in the body:
+
+```
+function percent(int part, int whole): int {
+    return part * 100.0 / whole;     // a float, truncated to the declared int
+}
+
+function average(int[] xs): float {
+    var float total = 0;
+    for (x in xs) { total += x; }
+    return total / xs.len();         // average([1, 2]) is 1.5
+}
+```
+
+With a declared return type, every `return` must fit it: ints and floats convert (a float returned from an `int` function is truncated), and anything else — `return "x";` in an `int` function — is a compile error. Methods take a return type the same way: `fn area(): int { ... }`.
+
+Arguments are checked like assignments: an int passed to a `float` parameter is converted, a float passed to an `int` parameter is truncated, a child struct can be passed for its parent, and anything else (`add("x", 2)` for `add(int a, int b)`) is a compile error. The same goes for methods and built-ins, and calling with the wrong number of arguments is an error.
+
+### Functions as Values
+
+A function's name without parentheses is a value you can store in a variable, pass to another function, or call later. Its type is written `fn(parameter types): return type`:
+
+```
+function twice(int x): int { return x * 2; }
+function square(int x): int { return x * x; }
+
+function apply(fn(int): int f, int v): int {
+    return f(v);
+}
+
+main() {
+    var f = twice;             // f has type fn(int): int
+    print(f(3));               // 6
+    f = square;
+    print(apply(f, 5));        // 25
+    return 0;
+}
+```
+
+- Only functions you write can be values, not built-ins like `print` or `len`.
+- All of the function's parameters must have types.
+- A function returning an array, struct or tuple can only be a value if it always returns a new one, since whoever calls the value owns what it returns.
+- Arguments of a call through a value are checked against its type, and assigning a function of a different type (`fn(int): string` to an `fn(int): int` variable) is an error.
 
 ### Returning Multiple Values
 
@@ -276,10 +360,15 @@ main() {
 ### Creating Arrays
 
 ```
-var int[] a = new int[10];        // 1-D, zero-initialised
-var int[][] m = new int[4][4];    // 2-D, zero-initialised
-var int[] lit = [1, 2, 3, 4, 5]; // array literal
+var int[] a = new int[10];             // 1-D, zero-initialised
+var int[][] m = new int[4][4];         // 2-D, zero-initialised
+var int[] lit = [1, 2, 3, 4, 5];       // array literal
+var float[] f = [1.5, 2, 3];           // ints in a float array become floats
+var string[] names = ["ann", "bob"];   // array of strings
+var string[] blank = new string[3];    // three empty strings ("")
 ```
+
+The element type comes from the literal's elements (or from `new T[n]`). All elements must have the same type, except that ints, floats, chars and bools mix — a literal with any float is a `float[]`.
 
 ### Reading and Writing
 
@@ -289,6 +378,72 @@ var int v = a[0];
 
 m[2][3] = 99;
 var int w = m[2][3];
+
+names[1] = "bea";
+print(names[1] + "!");    // bea!
+```
+
+Storing a string into a `string[]` stores a copy, so changing the variable afterwards doesn't change the array. The array owns its strings and frees them when it's freed.
+
+An index the compiler can see is out of range (`a[3]` on a literal of one element) is a compile error; otherwise it is checked when the program runs and stops it with `Error: index out of bounds` (see [Runtime Errors](#runtime-errors)).
+
+### Growing and Shrinking
+
+Arrays can change size:
+
+| Method           | Effect                                                               |
+|------------------|----------------------------------------------------------------------|
+| `a.push(v)`      | Adds `v` at the end                                                  |
+| `a.pop()`        | Removes the last element and returns it                              |
+| `a.insert(i, v)` | Inserts `v` before index `i` (`i` can be `a.len()`, the end)         |
+| `a.remove(i)`    | Removes the element at index `i` and returns it                      |
+
+```
+var int[] a = [];          // an empty int[]
+a.push(1);
+a.push(2);
+a.insert(0, 9);            // [9, 1, 2]
+print(a.remove(1));        // 1  → a is [9, 2]
+print(a.pop());            // 2  → a is [9]
+print(a.len());            // 1
+```
+
+- `pop()` on an empty array and `insert`/`remove` at an index outside the array stop the program with an error.
+- An array passed to a function is the same array, so a function can push to its parameter and the caller sees the new elements.
+- Pushing a string stores a copy. Pushing an array or struct moves it into the array, like any other store into a container (see [Arrays Stored Inside Arrays](#arrays-stored-inside-arrays)).
+- `pop()` and `remove(i)` hand the element back: a popped string, array or struct belongs to the variable it's stored in.
+- An `int` pushed to a `float[]` is converted; pushing a value of the wrong type is a compile error.
+
+### Arrays of Structs
+
+```
+struct P {
+    var name: string;
+    var n: int;
+}
+
+var P[] ps = [P { name: "a", n: 1 }, P { name: "b", n: 2 }];
+ps[1].n = 20;                 // change a field of an element
+ps[0] = P { name: "c", n: 3 };  // replace an element (the old one is freed)
+for (p in ps) { print(p.n); }
+
+var P[] more = new P[5];      // five zeroed structs, ready to use
+more[4].name = "e";
+```
+
+A struct stored into the array moves into it, like storing into any container (see [Arrays Stored Inside Arrays](#arrays-stored-inside-arrays)). Arrays of structs and arrays of arrays can't be sliced, because their elements can't be copied.
+
+### Chained Access
+
+`[i]`, `.field`, `.len()` and method calls work on any expression, not just a variable name:
+
+```
+d.tags[1] = 5;            // an array field of a struct
+print(d.tags.len());
+print(ps[i].name);        // a field of an array element
+print(box.inner.x);       // a struct inside a struct
+print(makePoint(3).x);    // a field of a returned struct
+print(pair().1);          // an element of a returned tuple
 ```
 
 ### Length
@@ -299,7 +454,7 @@ var int n = a.len();
 
 ### Slicing
 
-Returns a new array with elements from index `start` up to (not including) `end`:
+Returns a new array with elements from index `start` up to (not including) `end`. Slicing a `string[]` copies its strings; arrays of structs or arrays can't be sliced.
 
 ```
 var int[] full = [10, 20, 30, 40, 50];
@@ -321,13 +476,71 @@ var string ns = inttostr(42);       // integer to string → "42"
 var int i    = strtoint("7");       // string to integer → 7
 ```
 
-### String Equality
+### Escape Sequences
+
+A backslash in a string or char literal starts an escape:
+
+| Escape | Character          |
+|--------|--------------------|
+| `\n`   | newline            |
+| `\t`   | tab                |
+| `\r`   | carriage return    |
+| `\0`   | the zero byte      |
+| `\\`   | backslash          |
+| `\"`   | double quote       |
+| `\'`   | single quote       |
+
+```
+print("name:\tL\n\"quoted\"");
+var c = '\n';                    // 10
+```
+
+Any other escape (`"\q"`) is a compile error, and so is a string with no closing quote.
+
+### Comparing Strings
+
+`==` and `!=` compare the text. `<`, `<=`, `>` and `>=` order strings alphabetically, byte by byte (so uppercase letters come before lowercase, and `"apple" < "apples"`):
 
 ```
 if (s == "Hello") {
     print(1);
 }
+print("apple" < "banana");   // 1
 ```
+
+### Characters and Substrings
+
+`s[i]` is the character code at index `i`, and `s[a..b]` is a new string with the characters from `a` up to (not including) `b`. Out-of-range bounds are clamped to the string, so a substring is never longer than what's there:
+
+```
+var string s = "Hello, World";
+print(s[0]);        // 72 ('H')
+print(s[0..5]);     // Hello
+print(s[7..100]);   // World
+```
+
+Strings can't be changed in place (`s[0] = 'J'` is an error) — build a new string instead.
+
+### String Functions
+
+| Function               | Result                                                          |
+|------------------------|-----------------------------------------------------------------|
+| `len(s)` / `s.len()`   | Number of characters                                            |
+| `str_find(s, part)`    | Index of the first occurrence of `part` in `s`, or `-1`         |
+| `str_contains(s, part)`| `1` if `part` occurs in `s`, else `0`                           |
+| `str_upper(s)`         | A copy with `a`–`z` in uppercase                                |
+| `str_lower(s)`         | A copy with `A`–`Z` in lowercase                                |
+| `chartostr(c)`         | A one-character string                                          |
+| `inttostr(n)`          | The integer as text                                             |
+| `strtoint(s)`          | The text as an integer                                          |
+| `floattostr(f)`        | The float as text (`2.5` → `"2.5"`, `10.0` → `"10"`)            |
+| `str_split(s, sep)`    | A `string[]` of the pieces between each `sep` (`"a,b,,c"` → `"a"`, `"b"`, `""`, `"c"`) |
+| `str_join(parts, sep)` | The strings in `parts` joined with `sep` between them           |
+| `str_trim(s)`          | A copy without spaces, tabs and newlines at either end          |
+| `str_replace(s, from, to)` | A copy with every `from` replaced by `to`                   |
+| `strtofloat(s)`        | The text as a float (`"-12.5e2"` → `-1250.0`)                   |
+
+`str_split`, `str_join`, `str_trim`, `str_replace` and `strtofloat` are written in L in `stdlib/string.l`, which is imported automatically when a program uses one of them (see [string](#string)).
 
 ### Printing Strings
 
@@ -348,6 +561,8 @@ var int d = c + 1;     // d = 66  (the code for 'B')
 printchar(c);          // prints: A
 printchar(d);          // prints: B
 ```
+
+Escapes work in char literals too: `'\n'`, `'\t'`, `'\''`, `'\\'` (see [Escape Sequences](#escape-sequences)).
 
 You can compare chars the same way you compare integers:
 
@@ -371,6 +586,62 @@ print(t.2);    // 30
 ```
 
 Tuples are most useful as multiple return values from functions (see [Functions](#functions)).
+
+A tuple's type is its element types in parentheses. Write it wherever a type goes — a parameter, a variable, a struct field, or an array of tuples — so the compiler knows what each element is:
+
+```
+function show((string, int) t) {
+    print(t.0 + ": " + inttostr(t.1));
+    return 0;
+}
+
+var (string, (int, string)) nested = ("a", (2, "b"));
+print(nested.1.1);                          // b
+var (string, int)[] scores = [("ann", 3), ("bob", 5)];
+```
+
+Passing a tuple of the wrong type to a tuple parameter, or reading an element past the end (`t.2` on a pair), is a compile error.
+
+---
+
+## Maps
+
+A map stores values under keys. Its type is `map<K, V>`: keys of type `K` (`int`, `float`, `char`, `bool` or `string`) and values of any type `V`, including arrays, structs and other maps.
+
+```
+var map<string, int> ages = {};           // an empty map
+ages["ann"] = 31;
+ages["bob"] = 27;
+ages["ann"] = 32;                         // replaces the old value
+print(ages["ann"]);                       // 32
+
+var map<int, string> names = { 1: "one", 2: "two" };   // a map literal
+```
+
+| Operation        | Result                                                     |
+|------------------|------------------------------------------------------------|
+| `m[k]`           | The value stored under `k`                                  |
+| `m[k] = v`       | Stores `v` under `k`, replacing (and freeing) any old value |
+| `m.has(k)`       | `1` if `k` is in the map, else `0`                          |
+| `m.remove(k)`    | Removes `k` and its value (nothing happens if it's missing) |
+| `m.len()`        | The number of keys                                          |
+| `m.keys()`       | A new array of the keys                                     |
+| `for (k in m)`   | Loops over the keys                                         |
+
+```
+if (ages.has("bob")) {
+    ages.remove("bob");
+}
+for (name in ages) {
+    print(name + ": " + inttostr(ages[name]));
+}
+```
+
+- Reading a key that isn't in the map stops the program with `Error: key not found in map` — check with `has` first.
+- String keys are compared by their text and copied into the map. The order of `keys()` and of a `for` loop is not the order the keys were added.
+- A key of the wrong type (`m[3]` on a `map<string, int>`) is a compile error, and so are struct, array and map keys.
+- Values follow the same rules as array elements: a string is copied in, an array or struct moves in, and the map frees its values when it is freed. Like arrays, a map passed to a function is the same map, so the function's changes are seen by the caller.
+- Maps nest: `var map<string, map<string, int>> m = {};` then `m["a"] = {};` and `m["a"]["b"] = 1;`.
 
 ---
 
@@ -402,6 +673,41 @@ main() {
 
 - `var` fields are mutable after construction.
 - `const` fields are read-only — assigning to them is a compile error.
+- A field can hold any type, including arrays (`var tags: int[];`), other structs (`var inner: Point;`), arrays of structs (`var items: Node[];`) or the struct's own type (`var next: Node;`, for linked lists).
+- A field can have a default, used when a struct literal (or `new P[n]`) doesn't give it a value. The default is evaluated again for every struct, so each gets its own array or struct:
+
+  ```
+  struct Team {
+      var name: string = "unnamed";
+      var scores: int[] = [];
+      var captain: Player = Player { };
+  }
+  var t = Team { };        // name "unnamed", no scores, a default captain
+  ```
+
+  A string, array or struct default must be a new value (a literal, `new`, a struct, or a call that returns a new value) — not another variable.
+- A numeric field with no default starts as `0`. A string, array or struct field with no default that is never set has no value: reading it stops the program with `Error: Team.scores was never set` (after anything already printed). Setting it later (`t.scores = [1];`) is fine.
+- A string, array, struct or map field can be `none` — empty on purpose. Give it as the default (`var next: Node = none;`) or in a literal (`Node { val: 1, next: none }`), assign it (`n.next = none;` frees the old value), and test for it with `==` / `!=`:
+
+  ```
+  struct Node {
+      var val: int;
+      var next: Node = none;
+  }
+
+  var n = Node { val: 1, next: Node { val: 2 } };
+  var total = 0;
+  var Node cur = n;
+  while (true) {
+      total += cur.val;
+      if (cur.next == none) { break; }
+      cur = cur.next;
+  }
+  ```
+
+  Reading a field that is `none` (other than comparing it) stops the program with `Error: Node.next was never set (or is none)`. `none` can only be stored in a struct field or compared with `==` / `!=`: a local variable, argument, array element, or number field can't be `none`.
+- A child inherits its parent's defaults.
+- Fields of fields, elements of array fields and methods of nested structs chain as expected: `box.inner.x = 3;`, `d.tags[0] += 1;`, `l.items[i].val`.
 
 ### Methods
 
@@ -434,7 +740,9 @@ struct Dog extends Animal {
 
 - The child gains all parent fields. List parent fields first when constructing: `Dog { name: "Rex", breed: "Lab" }`.
 - Overridden methods are dispatched dynamically — calling `speak()` on a variable typed as `Animal` that holds a `Dog` will call the dog's version.
-- Methods not listed in `overrides` are inherited unchanged.
+- Methods not listed in `overrides` are inherited unchanged, from the nearest ancestor that defines them.
+- A child can be stored wherever its parent type is expected — a parent-typed variable, field or array — and is still freed as the child it is (its own fields included). An array literal mixing a parent and its children is an array of the parent: `[Dog { ... }, Animal { ... }]` is an `Animal[]`.
+- The reverse is an error: an `Animal` can't be stored where a `Dog` is expected.
 
 ---
 
@@ -446,12 +754,17 @@ Break code into multiple files. The `import` statement is resolved at compile ti
 import math;
 ```
 
-L searches for the module in two places, in this order:
+L searches for the module in these places, in this order:
 
-1. `headers/<name>.l` relative to the source file
-2. `stdlib/<name>.l` in the compiler's standard library directory
+1. `<name>.l` in the same folder as the importing file — only when the import is inside an imported file (a header or a stdlib module), so headers can import each other and stdlib modules always find their own siblings
+2. `headers/<name>.l` relative to the main source file
+3. `stdlib/<name>.l` in the compiler's standard library directory
+
+The main source file only imports from `headers/` and `stdlib/`, not from `.l` files next to it.
 
 Duplicate imports are silently deduplicated — importing the same module twice has no effect.
+
+An error inside an imported file is reported on the `import` line of your file, naming the imported file and the line in it: `Error: 2:1: in headers/utils.l at 5:9: ...`.
 
 ### Example: local header
 
@@ -500,10 +813,15 @@ These functions are always available without any import.
 | `print(v)`      | Print an integer or string, followed by newline |
 | `printchar(c)`  | Print a character by its ASCII code             |
 | `input()`       | Read an integer from stdin                      |
-| `inputstr()`    | Read a line of text from stdin                  |
+| `inputstr()`    | Read a line of text from stdin (up to 255 characters, newline removed; `""` for an empty line or end of input) |
 | `len(s)`        | Length of a string                              |
 | `inttostr(n)`   | Convert an integer to its string representation |
 | `strtoint(s)`   | Parse a string as an integer                    |
+| `floattostr(f)` | Convert a float to its string representation    |
+| `chartostr(c)`  | A one-character string                          |
+| `str_find(s, p)`| Index of `p` in `s`, or `-1`                    |
+| `str_contains(s, p)` | `1` if `p` occurs in `s`, else `0`         |
+| `str_upper(s)`, `str_lower(s)` | A copy in upper / lower case     |
 
 ---
 
@@ -515,8 +833,9 @@ The standard library lives in the `stdlib/` folder next to the compiler. Each fi
 |------------|--------------------|-----------------------------------------------------------|
 | `math`     | `import math;`     | Integer helpers, float conversion, rounding, trig, roots, logs and powers |
 | `graphics` | `import graphics;` | An OpenGL window with pixel drawing, keyboard input and timing |
+| `string`   | automatic          | `str_split`, `str_join`, `str_trim`, `str_replace`, `strtofloat`, `str_is_space` |
 
-Both modules are written in plain L, so you can read `stdlib/*.l` to see exactly how each function works. Every function is prefixed with its module name (`math_`, `gfx_`) to avoid clashing with your own code.
+The modules are written in plain L, so you can read `stdlib/*.l` to see exactly how each function works. `math` and `graphics` functions are prefixed with their module name (`math_`, `gfx_`) to avoid clashing with your own code; the `string` functions start with `str_` (and `strtofloat`).
 
 ### math
 
@@ -558,9 +877,10 @@ All rounding functions take a `float` and return an `int`.
 | `math_fmod(float x, float step)`  | `float` | Remainder of `x / step`; takes the sign of `x`               |
 | `math_sqrt(float x)`              | `float` | Square root (20 Newton–Raphson iterations). Returns `0.0` for `x <= 0` |
 | `math_ln(float x)`                | `float` | Natural logarithm. Returns `0.0` for `x <= 0`                |
-| `math_pow(float base, float exp)` | `float` | `base` raised to `exp`, computed as `e^(exp · ln base)`      |
+| `math_pow(float base, float exp)` | `float` | `base` raised to `exp`                                        |
+| `math_exp(float t)`               | `float` | `e` raised to `t`                                            |
 
-> `math_pow` uses a 7-term Taylor series for `e^t`, so it is accurate when `exp · ln(base)` is small (roughly `|t| < 2`) and drifts for large results. Because it goes through `math_ln`, `base` must be positive.
+> A whole-number `exp` is multiplied out, so `math_pow(2.0, 10.0)` is exact and a negative `base` works. Any other `exp` is computed as `math_exp(exp · ln base)`, accurate to about 9 significant digits; `base` must then be positive (a negative `base` returns `1.0`).
 
 #### Trigonometry
 
@@ -674,6 +994,45 @@ gfx_rect(10, 130, 100, 50, 0x0000FF);  // blue
 
 Key codes are GLFW key codes, so any key not listed can be passed as a number (e.g. `gfx_key(81)` for Q).
 
+### string
+
+`stdlib/string.l` is imported automatically when a program calls one of its functions, so there's no `import` to write (`import string;` also works). A program that defines its own function with one of these names keeps its own version, and the module isn't imported.
+
+| Function                   | Result                                                               |
+|----------------------------|----------------------------------------------------------------------|
+| `str_split(s, sep)`        | A new `string[]` of the pieces of `s` between each `sep`; an empty `sep` gives `[s]` |
+| `str_join(parts, sep)`     | The strings in `parts` with `sep` between each pair                  |
+| `str_trim(s)`              | `s` without spaces, tabs, carriage returns and newlines at either end |
+| `str_replace(s, from, to)` | `s` with every occurrence of `from` replaced by `to` (an empty `from` changes nothing) |
+| `strtofloat(s)`            | The number at the start of `s`: optional sign, digits, fraction and exponent; leading spaces are skipped and parsing stops at anything else |
+| `str_is_space(c)`          | `1` if `c` is a space, tab, newline or carriage return               |
+
+```
+var string line = "  ann, bob ,cy ";
+var string[] names = str_split(str_trim(line), ",");
+var i = 0;
+while (i < names.len()) {
+    names[i] = str_trim(names[i]);
+    i++;
+}
+print(str_join(names, " & "));      // ann & bob & cy
+print(strtofloat("2.5e1") + 1);     // 26
+```
+
+---
+
+## Runtime Errors
+
+Some mistakes can only be caught while the program runs. When one happens the program prints an error to stderr, after anything it has already printed, and exits with status 1:
+
+| Error                                   | Cause                                                        |
+|-----------------------------------------|--------------------------------------------------------------|
+| `Error: index out of bounds`            | An array index outside the array, or `insert`/`remove` at one |
+| `Error: division by zero`               | An integer `/` or `%` by zero                                |
+| `Error: pop from an empty array`        | `pop()` on an array with no elements                         |
+| `Error: key not found in map`           | Reading a map key that isn't there                           |
+| `Error: P.f was never set (or is none)` | Reading a struct field that was never given a value, or is `none` |
+| `Error: negative array size`            | `new int[n]` with a negative `n`                             |
 
 ---
 
@@ -736,21 +1095,42 @@ L has three categories of values:
 
 **Stack values** — `int`, `float`, `bool`, `char`. These live in the function's stack frame and cost nothing to create or destroy. When the function returns, they're gone.
 
-**Heap values** — `string`, arrays, structs, tuples. These are `malloc`'d on the heap. Every heap value has exactly one owner: the variable it was assigned to. When that owner goes out of scope, the compiler inserts a `free` call automatically.
+**Heap values** — `string`, arrays, maps, structs, tuples. These are `malloc`'d on the heap. Every heap value has exactly one owner: the variable it was assigned to. When that owner goes out of scope, the compiler inserts a `free` call automatically.
 
 There is no garbage collector. `free` calls are inserted statically at compile time based on where variables are declared, not at runtime based on reference counts or reachability.
 
 ### Ownership and Transfer
 
-When you assign a heap value from one variable to another, ownership transfers to the new variable. The original is no longer considered the owner and won't be freed:
+Strings are copied. Assigning a string from another variable, a string literal or a parameter gives the new variable its own copy, so each string variable owns its own memory and the two are independent:
 
 ```
-var string a = "hello";
-var string b = a;       // b is now the owner — a will NOT be freed
-print(b);
+var string a = inttostr(7);
+var string b = a;       // b gets its own copy of "7"
+a = inttostr(8);        // b is unaffected
+print(b);               // 7
 ```
 
-This means **you should not use `a` after transferring it to `b`** — the compiler doesn't currently enforce this (it will compile), but the memory behind `a` now belongs to `b` and will be freed when `b` goes out of scope.
+A string that is already new (the result of `+`, or of a call that returns a string) is not copied again; the variable simply takes ownership of it. A string parameter that the function reassigns is copied on entry, so the caller's string is never freed.
+
+Arrays, structs and tuples are not copied: assigning one to another variable makes both refer to the same value. The variable that was given a *new* value (`new`, a literal, a struct, a call that returns a new value) **owns** it and frees it; any other variable holding it just **refers** to it:
+
+```
+var int[] a = [1, 2];     // a owns the array
+var int[] b = a;          // b refers to a's array
+print(b[1]);              // 2
+b[0] = 9;                 // changes the array a owns
+print(a[0]);              // 9
+```
+
+A variable that refers to another value (a copy of another variable, an element read out of an array, a struct field, a parameter, or the result of a call that may return one of its arguments) can't be used once that value may have been freed. The compiler reports an error if:
+
+- the owner is reassigned (`a = new int[3];` frees a's old array, so `b` can't be used after it),
+- an array or struct inside it is replaced (`d.tags = new int[2];` frees the old `d.tags`),
+- it is moved into an array, struct or tuple,
+- it is passed to a function that may change it (the compiler works out which parameters each function can change, so passing it to a function that only reads it is fine),
+- the variable would outlive it (declared outside a loop but referring to something declared inside it).
+
+Give the variable a new value and it can be used again. A variable that refers to something else also can't be stored into an array, struct or tuple (the container would free it too), and a function can't return something that points into its own locals. A parameter belongs to the caller, so it can't be stored into a container either.
 
 When a heap value is returned from a function, ownership transfers to the caller. The function does not free it:
 
@@ -768,6 +1148,8 @@ main() {
 }
 ```
 
+A function that returns a string always hands the caller a string it owns. If the returned value isn't already a new string (for example a string literal, a parameter, a global or a variable), the compiler returns a copy of it, so the caller can free the result safely.
+
 ### Arrays Stored Inside Arrays
 
 When you store a value into an array slot, ownership transfers into the array. The compiler will not also free it from its original variable. This matters most for 2D arrays:
@@ -781,15 +1163,48 @@ var int[][] grid = new int[3][4];
 
 For a 2D array, the compiler inserts a loop that frees each row individually before freeing the outer array. This is handled automatically — you don't write it.
 
+The same applies whenever you store an array or struct variable into an array slot, a struct field, a tuple or an array literal: the value moves into the container, which now owns it. The variable can't be used again until you assign it a new value — the compiler reports an error if you do:
+
+```
+var int[][] m = new int[2][3];
+var int[] row = new int[3];
+m[0] = row;         // row moves into m
+row[1] = 7;         // error: row was stored into an array or struct
+row = new int[3];   // fine: row holds a new array
+row[1] = 7;         // fine
+```
+
+The check is conservative: if a variable is stored on only one branch of an `if`, or anywhere in a loop body, it counts as moved after the `if` and in the next iteration. Declaring the variable inside the loop avoids this, since each iteration gets a new one. Strings are copied into struct fields and tuples rather than moved, so a string variable stays usable.
+
+### Global Arrays and Structs
+
+When a global array, struct or tuple is reassigned, its old value is freed. The compiler makes sure nothing can still be pointing at that old value:
+
+```
+var int[] G = [1, 2];
+
+main() {
+    var int[] a = G;        // a points at G's current array
+    G = new int[3];         // the old [1, 2] is freed
+    print(a[0]);            // error: a points at G's old value
+    a = new int[2];         // fine: a has its own array now
+    return 0;
+}
+```
+
+- A local copied from a global can't be used after the global is reassigned — in the same function, or by any function it calls — until the local is given a new value.
+- A global (or a local copied from one) can't be passed to a function that may reassign that global, stored into an array, struct or tuple, returned from a function, or looped over by a `for` loop that reassigns it.
+- A global can only be given a value nothing else points to: `new`, a literal, a struct or tuple, a slice, a call to a function that always returns a new value, or a local that owns its value. The local is moved into the global and can't be used afterwards.
+
+Global strings are copied like any other string, so none of this applies to them.
+
 ### What Is and Isn't Safe
 
 **Safe:** Creating, using, and returning heap values normally. The compiler handles the `free` placement.
 
 **Safe:** Passing heap values to functions — the function receives a copy of the pointer, but the caller retains ownership and frees it after the call returns.
 
-**Use with care:** Transferring ownership via assignment and then continuing to use the original variable. The compiler won't stop you, but the original is now an alias to memory owned by someone else.
-
-**Use with care:** Storing a heap value into a data structure (like a struct field or array slot). Once stored, the container owns it. Don't also try to free it from the original variable.
+**Safe:** Variables that refer to another variable's array or struct, and values stored into containers. The compiler checks that nothing is used after it may have been freed (see [Ownership and Transfer](#ownership-and-transfer)), and reports an error instead of producing a program that reads freed memory.
 
 **Unsafe:** `asm { }` blocks that manually call `free`, or that store pointers the compiler doesn't know about. If you free something the compiler also tries to free, you'll get a double-free. If you allocate something the compiler doesn't know about, it will leak.
 

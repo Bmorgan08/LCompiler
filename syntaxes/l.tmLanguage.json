@@ -5,7 +5,9 @@
   "patterns": [
     { "include": "#comments" },
     { "include": "#strings" },
+    { "include": "#chars" },
     { "include": "#keywords" },
+    { "include": "#constants" },
     { "include": "#types" },
     { "include": "#builtins" },
     { "include": "#struct-declaration" },
@@ -36,15 +38,26 @@
         }
       ]
     },
+    "chars": {
+      "name": "string.quoted.single.l",
+      "match": "'(\\\\.|[^'\\\\])'",
+      "captures": {
+        "1": { "patterns": [{ "name": "constant.character.escape.l", "match": "\\\\." }] }
+      }
+    },
+    "constants": {
+      "name": "constant.language.l",
+      "match": "\\b(true|false|none)\\b"
+    },
     "keywords": {
       "patterns": [
         {
           "name": "keyword.control.l",
-          "match": "\\b(if|else|while|for|break|continue|return)\\b"
+          "match": "\\b(if|else|while|for|in|match|break|continue|return)\\b"
         },
         {
           "name": "keyword.declaration.l",
-          "match": "\\b(var|function|fn|struct|extends|overrides|new|const)\\b"
+          "match": "\\b(var|let|function|fn|struct|extends|overrides|new|const|import|asm|main)\\b"
         },
         {
           "name": "variable.language.l",
@@ -54,11 +67,11 @@
     },
     "types": {
       "name": "storage.type.l",
-      "match": "\\b(int|bool|string)\\b(?=\\s*[\\[\\]\\w])"
+      "match": "\\b(int|bool|string|float|char|void|map)\\b"
     },
     "builtins": {
       "name": "support.function.builtin.l",
-      "match": "\\b(print|printchar|input|inputstr|len|strtoint|inttostr)\\b(?=\\s*\\()"
+      "match": "\\b(print|printchar|input|inputstr|len|strtoint|inttostr|chartostr|floattostr|str_find|str_contains|str_upper|str_lower|str_split|str_join|str_trim|str_replace|strtofloat|str_is_space|ord|chr|print_string|print_int)\\b(?=\\s*\\()"
     },
     "struct-declaration": {
       "match": "\\b(struct)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(extends)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
@@ -92,7 +105,7 @@
     },
     "numbers": {
       "name": "constant.numeric.l",
-      "match": "-?\\b[0-9]+\\b"
+      "match": "-?\\b(0x[0-9A-Fa-f]+|[0-9]+(\\.[0-9]+)?)\\b"
     },
     "operators": {
       "patterns": [
@@ -123,7 +136,7 @@
           }
         },
         {
-          "match": "(?<=[A-Za-z0-9_\\]\\)])(\\.)(len)\\s*(?=\\()",
+          "match": "(?<=[A-Za-z0-9_\\]\\)])(\\.)(len|push|pop|insert|remove|has|keys)\\s*(?=\\()",
           "captures": {
             "1": { "name": "punctuation.accessor.l" },
             "2": { "name": "support.function.builtin.l" }

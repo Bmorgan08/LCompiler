@@ -16,26 +16,30 @@ main() {
 ## Features
 
 - Compiled to native x86-64 — no VM, no interpreter
-- Static types: `int`, `float`, `bool`, `char`, `string`, arrays, structs, tuples
-- Automatic memory management — heap values freed at compile time, no GC, no manual `free`
-- Structs with methods and single inheritance
+- Static types: `int`, `float`, `bool`, `char`, `string`, typed arrays (`int[]`, `float[]`, `string[]`, arrays of structs, 2-D), structs, tuples, maps (`map<string, int>`) and function types (`fn(int): int`)
+- Growable arrays (`push`, `pop`, `insert`, `remove`), declared return types, and argument type checks
+- `none` for empty struct fields (linked lists, optional values), and clear runtime errors for bad indexes, division by zero and missing map keys
+- Automatic memory management — heap values freed at compile time, no GC, no manual `free`, and use-after-free is a compile error
+- Structs with methods, single inheritance, nested structs and chained access (`ps[i].tags[0]`)
+- Strings with escape sequences, ordering, substrings, search/case helpers, and split/join/trim/replace; `const` variables
 - For-in loops, match expressions, short-circuit `&&`/`||`
 - Inline assembly via `asm { }`
-- Standard library (`math`, trig, string conversion, graphics)
-- VS Code extension with syntax highlighting and language server
+- Standard library (`math`, trig, strings, graphics)
+- VS Code extension with syntax highlighting and a language server that shows compiler errors on save
 
 ## Requirements
 
 - Node.js 18+
 - NASM
-- `ld` (GNU linker)
+- GCC (used to link, and to build the runtime `Typescript/runtime/lrt.c` the first time a program is compiled)
+- GLFW and OpenGL development libraries (linked for the `graphics` module)
 - Linux x86-64
 
 ## Building
 
 ```sh
 npm install
-npm run build       # compiles TypeScript to dist/
+npx tsc             # compiles TypeScript to dist/
 ```
 
 ## Usage
@@ -56,6 +60,20 @@ node dist/Main.js hello.l hello     # compiles to ./hello
 | `--asm`     | Print the generated assembly          |
 | `--tokens`  | Print the token stream                |
 | `--verbose` | Print all of the above                |
+| `--check`   | Only check for errors; write no files |
+
+## Tests
+
+```sh
+node Test/LanguageTests.js              # language suite
+node Test/StdlibTests.js                # standard library suite
+node Test/RegressionTests.js            # older whole-program tests (from the original Runner.js)
+node Test/IRTests.js                    # --ir output and optimizer passes
+node Test/ServerTests.js                # --check and the language server's diagnostics
+node Test/LanguageTests.js --memcheck --leaks   # also run every test under AddressSanitizer
+```
+
+Rebuild with `npx tsc` first; the tests run `dist/Main.js`. `Test/known-bugs.js` records every bug found so far and how it was fixed.
 
 ## Language Reference
 
@@ -68,14 +86,21 @@ The `syntaxes/` and `client/` directories contain a VS Code extension providing 
 ## Project Structure
 
 ```
-Typescript/       compiler source (TypeScript)
-  Lexer.ts
-  Parser.ts
-  TypeChecker.ts
-  IRGen.ts
-  CodeGen.ts
-stdlib/           standard library modules (.l)
-client/           VS Code extension client
-server/           VS Code language server
-Test/             test programs
+Typescript/            compiler source (TypeScript)
+  Main.ts              driver: imports, pipeline, assembling and linking
+  Modules/Lexer.ts     tokens
+  Modules/Parser.ts    AST
+  Modules/Scope.ts     symbols, scopes and struct definitions
+  Modules/Declare.ts   declares functions, globals and structs
+  Modules/Validate.ts  type checks and memory-safety checks
+  Modules/Fresh.ts     which functions always return a new value
+  Modules/IR.ts        AST -> IR
+  Modules/Optimize.ts  copy propagation, CSE, and where values are freed
+  Modules/Emitter.ts   IR -> NASM
+  runtime/lrt.c        C runtime for growable arrays and maps (built into lrt.o on first use)
+  runtime/graphics.c   C runtime for the graphics module
+stdlib/                standard library modules (.l); string.l is imported automatically
+client/                VS Code extension client
+server/                VS Code language server
+Test/                  test suites
 ```

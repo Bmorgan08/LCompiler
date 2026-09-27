@@ -531,6 +531,11 @@ function makeBuiltins() {
         { name: "len", kind: "func", params: 1, detail: "len(s) → int — length of a string" },
         { name: "strtoint", kind: "func", params: 1, detail: "strtoint(s) → int — parse string to int" },
         { name: "inttostr", kind: "func", params: 1, detail: "inttostr(n) → string — convert int to string" },
+        { name: "chartostr", kind: "func", params: 1, detail: "chartostr(c) → string — one-character string" },
+        { name: "str_find", kind: "func", params: 2, detail: "str_find(s, part) → int — index of part in s, or -1" },
+        { name: "str_contains", kind: "func", params: 2, detail: "str_contains(s, part) → int — 1 if part occurs in s" },
+        { name: "str_upper", kind: "func", params: 1, detail: "str_upper(s) → string — copy in uppercase" },
+        { name: "str_lower", kind: "func", params: 1, detail: "str_lower(s) → string — copy in lowercase" },
     ];
 }
 function analyzeDocument(source) {

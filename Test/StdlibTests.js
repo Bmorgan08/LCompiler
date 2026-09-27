@@ -111,13 +111,22 @@ const tests = [
     approxTest("math_ln of a small value", [["math_ln(0.01)", -4.605170185988091, 1e-6]]),
     approxTest("math_ln of 0 and negatives returns 0 (documented)", [["math_ln(0.0)", 0.0, 0.0], ["math_ln(-3.0)", 0.0, 0.0]]),
 
-    approxTest("math_pow within the documented range", [
-        ["math_pow(9.0, 0.5)", 3.0, 1e-4], ["math_pow(2.0, 0.5)", 1.4142135623730951, 1e-7],
-        ["math_pow(10.0, 0.3)", 1.9952623149688795, 1e-5], ["math_pow(1.5, 2.0)", 2.25, 1e-4], ["math_pow(5.0, 0.0)", 1.0, 0.0],
+    approxTest("math_pow with small exponents", [
+        ["math_pow(9.0, 0.5)", 3.0, 1e-8], ["math_pow(2.0, 0.5)", 1.4142135623730951, 1e-8],
+        ["math_pow(10.0, 0.3)", 1.9952623149688795, 1e-8], ["math_pow(1.5, 2.0)", 2.25, 1e-12], ["math_pow(5.0, 0.0)", 1.0, 0.0],
     ]),
-
-    // outside |exp * ln(base)| < 2 LANGUAGE.md documents that math_pow drifts
-    approxTest("math_pow outside the documented range", [["math_pow(2.0, 3.0)", 8.0, 1e-6], ["math_pow(2.0, 10.0)", 1024.0, 1e-3]], { bug: "S3" }),
+    approxTest("math_pow with whole-number exponents is exact", [
+        ["math_pow(2.0, 3.0)", 8.0, 0.0], ["math_pow(2.0, 10.0)", 1024.0, 0.0], ["math_pow(3.0, 20.0)", 3486784401.0, 0.0],
+        ["math_pow(2.0, -3.0)", 0.125, 0.0], ["math_pow(-2.0, 3.0)", -8.0, 0.0],
+    ]),
+    approxTest("math_pow with large non-integer results", [
+        ["math_pow(2.5, 3.7)", 29.67413253642086, 1e-6], ["math_pow(7.3, 4.2)", 4226.258064648484, 1e-4],
+        ["math_pow(1.0001, 10000.0)", 2.7181459268249255, 1e-8], ["math_pow(2.0, -3.3)", 0.10153154954452945, 1e-9],
+    ]),
+    approxTest("math_exp", [
+        ["math_exp(0.0)", 1.0, 0.0], ["math_exp(1.0)", 2.718281828459045, 1e-9],
+        ["math_exp(-2.5)", 0.0820849986238988, 1e-10], ["math_exp(10.3)", 29732.618852891435, 1e-4],
+    ]),
 
     // ── Trigonometry (about 8 significant digits, per LANGUAGE.md) ──────
 
@@ -155,7 +164,6 @@ const tests = [
       expected: "32\n65\n68\n83\n87\n256\n257\n262\n263\n264\n265\n340" },
     { name: "graphics: gfx_log",
       source: gfxMain(`    gfx_log("hello");`), expected: "[gfx] hello" },
-    // passes only because rax happens to be 0 - see B23 and the --gfx test below
     { name: "graphics: gfx_get_time returns a float (0 before gfx_init)",
       source: gfxMain(`    var float t = gfx_get_time();\n    print(t);`), expected: "0" },
 
@@ -181,7 +189,7 @@ const tests = [
     print(gfx_key(KEY_SPACE));
     gfx_destroy_window();`),
       expected: "320\n240\n0\n0" },
-    { name: "graphics: gfx_get_time increases after gfx_init", gfx: true, bug: "B23",
+    { name: "graphics: gfx_get_time increases after gfx_init", gfx: true,
       source: gfxMain(`    gfx_init(64, 64);
     var float a = gfx_get_time();
     var int frame = 0;

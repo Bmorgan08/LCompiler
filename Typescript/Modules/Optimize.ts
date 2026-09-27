@@ -1,5 +1,5 @@
 import { Node } from "./Parser";
-import { IR } from "./IR";
+import { IR, isHeapT } from "./IR";
 
 export function fold(node: Node): Node {
     switch (node.type) {
@@ -30,6 +30,12 @@ export function fold(node: Node): Node {
                     return { ...node, children: [left, right] };
                 }
 
+                // two ints compare exactly (as 64-bit values), not as JS numbers
+                if (/^-?\d+$/.test(left.value!) && /^-?\d+$/.test(right.value!) && left.varType !== "float" && right.varType !== "float") {
+                    const a = BigInt.asIntN(64, BigInt(left.value!)), b = BigInt.asIntN(64, BigInt(right.value!));
+                    const cmp: Record<string, boolean> = { "==": a === b, "!=": a !== b, "<": a < b, ">": a > b, "<=": a <= b, ">=": a >= b };
+                    if (node.value! in cmp) return { type: "Number", value: cmp[node.value!] ? "1" : "0", varType: "bool", children: [] };
+                }
                 switch (node.value) {
                     case "==":
                         return { type: "Number", value: (l === r ? "1" : "0"), varType: "bool", children: [] };
@@ -56,6 +62,10 @@ export function fold(node: Node): Node {
                     case "+":
                         return operand;
                     case "-":
+                        // an int negates as a 64-bit value (parseFloat would round it above 2^53)
+                        if (operand.varType !== "float" && /^-?\d+$/.test(operand.value!)) {
+                            return { type: "Number", value: BigInt.asIntN(64, -BigInt(operand.value!)).toString(), varType: operand.varType, children: [] };
+                        }
                         return { type: "Number", value: (parseFloat(operand.value!) * -1).toString(), varType: operand.varType, children: [] };
                 }
             }
@@ -212,11 +222,16 @@ export function copyProp(IR: IR[]): IR[] {
         const copy: any = { ...instr };
 
         for (const key in copy) {
-            if (key === "op" || key === "dst" || key === "args") continue;
+            // type names and messages aren't operands (a variable could share a struct's name)
+            if (["op", "dst", "args", "type", "elemType", "fieldType", "retType", "structName", "message", "name", "fn"].includes(key)) continue;
+            // nor is a literal's value ("x" must stay "x" even when a variable x is a copy of something);
+            // ret's value is an operand, though
+            if (key === "value" && (instr.op === "string_const" || instr.op === "const" || instr.op === "fconst")) continue;
             copy[key] = resolve(copy[key]);
         }
 
-        if (instr.op === "call") {
+        // a method call's receiver and arguments are resolved like a plain call's
+        if (instr.op === "call" || instr.op === "vtable_call" || instr.op === "call_indirect") {
             copy.args = (instr as any).args.map((arg: string) => {
                 let resolved = arg;
                 while (env.has(resolved)) {
@@ -306,10 +321,28 @@ export function insertFrees(ir: IR[]): IR[] {
             function isHeapAlloc(fi: IR): string | null {
                 if (fi.op === "array_new") return fi.dst;
                 if (fi.op === "struct_alloc") return fi.dst;
-                if (fi.op === "str_concat") return fi.dst;
+                if (fi.op === "str_concat") return fi.dst
+                if (fi.op === "str_dup") return fi.dst;
+                if (fi.op === "str_sub") return fi.dst;
                 if (fi.op === "alloc") return fi.dst;
-                if (fi.op === "call" && fi.dst && (fi.fn === "inputstr" || fi.fn === "inttostr" || fi.returns_string)) return fi.dst;
+                if (fi.op === "call" && fi.dst && (fi.fn === "inputstr" || fi.fn === "inttostr" || fi.returns_string || fi.returns_heap)) return fi.dst;
+                if (fi.op === "vtable_call" && (fi.returns_string || fi.returns_heap)) return fi.dst;
+                if (fi.op === "call_indirect" && (fi.returns_string || fi.returns_heap)) return fi.dst;
+                if (fi.op === "map_new" || fi.op === "map_keys") return fi.dst;
+                // a popped/removed element now belongs to whoever took it
+                if ((fi.op === "array_pop" || fi.op === "array_remove") && isHeapT(fi.elemType)) return fi.dst;
                 return null;
+            }
+
+            // the type of what an allocation creates, so it is freed along with everything it owns
+            function allocType(fi: IR): string | undefined {
+                if (fi.op === "array_new") return fi.type;
+                if (fi.op === "struct_alloc") return fi.structName;
+                if (fi.op === "alloc") return fi.type;
+                if ((fi.op === "call" || fi.op === "vtable_call" || fi.op === "call_indirect") && fi.returns_heap) return fi.retType;
+                if (fi.op === "array_pop" || fi.op === "array_remove") return fi.elemType;
+                if (fi.op === "map_new" || fi.op === "map_keys") return fi.type;
+                return undefined;
             }
 
             // Detect 2D arrays by the arr2d_end label pattern.
@@ -347,42 +380,105 @@ export function insertFrees(ir: IR[]): IR[] {
             // declared before a loop and reassigned inside it must survive the loop.
             const varScope = new Map<string, number>();
             const declDepth = new Map<string, number>();
+            const heldBy = new Map<string, string>(); 
+            const fieldsOf = new Map<string, number[]>()
+            // movs that give a global a value it owns; the global's old value is freed first.
+            // Validate.ts makes sure nothing else still points at that old value
+            const globalStores = new Set<IR>()
+            // movs that give a local a value it doesn't own (a global, a struct field, another
+            // variable's value); a local that also owns values at other times gets an ownership flag
+            const borrowMovs = new Set<IR>()
+            // owner -> the type of what it owns (see allocType); the emitter frees by type
+            const ownerType = new Map<string, string>();
+            const freeOp = (v: string): IR =>
+                ownerType.has(v) ? { op: "free", addr: v, type: ownerType.get(v)! }
+                : array2dRows.has(v) ? {op: "array_free_2d", arr: v, rows: array2dRows.get(v)!}
+                : fieldsOf.has(v) ? { op: "free", addr: v, fields: fieldsOf.get(v)!}
+                : { op: "free", addr: v }
+            const heapStores = new Set<IR>();
+            const isLoopStart = (name: string) => /^(while|for|forin)_start/.test(name);
+            const loopEnd = new Map<string, string>();
+            for (let k = 0; k + 1< fnInstrs.length; k++) {
+                const cur = fnInstrs[k], next = fnInstrs[k + 1];
+                if (cur.op === "jmp" && isLoopStart(cur.target) && next.op === "label") loopEnd.set(cur.target, next.name);
+            }
             {
                 let depth = 0;
                 const depthStack: string[] = [];
                 for (const fi of fnInstrs) {
-                    if (fi.op === "label" && fi.name.startsWith("while_start")) {
+                    if (fi.op === "label" && isLoopStart(fi.name)) {
                         depth++;
                         depthStack.push(fi.name);
                     }
-                    if (fi.op === "jmp" && depthStack.length > 0 && fi.target === depthStack[depthStack.length - 1]) {
+                    if (fi.op === "label" && depthStack.length > 0 && fi.name === loopEnd.get(depthStack[depthStack.length - 1])) {
                         depthStack.pop();
                         depth--;
                     }
                     const dst = isHeapAlloc(fi);
                     if (dst) varScope.set(dst, depth);
+                    if (dst && (fi.op === "struct_alloc" || fi.op === "alloc") && fi.heapFields?.length) fieldsOf.set(dst, fi.heapFields)
+                    if (dst && allocType(fi)) ownerType.set(dst, allocType(fi)!)
                     if (fi.op === "arg") declDepth.set(fi.dst, depth);
                     if (fi.op === "mov" && !/^t\d+$/.test(fi.dst) && (fi.decl || !declDepth.has(fi.dst))) {
                         declDepth.set(fi.dst, depth);
                     }
-                    if (fi.op === "mov") {
+                    if (fi.op === "mov" && !fi.dst.startsWith("__")) {
+                        // copyProp may have replaced a local moved into a global by the temp it came from
+                        if (globals.has(fi.dst) && !varScope.has(fi.src)) {
+                            const holder = heldBy.get(fi.src);
+                            if (holder !== undefined && varScope.has(holder)) {
+                                if (fieldsOf.has(holder)) fieldsOf.set(fi.dst, fieldsOf.get(holder)!);
+                                if (ownerType.has(holder)) ownerType.set(fi.dst, ownerType.get(holder)!);
+                                varScope.delete(holder);
+                                globalStores.add(fi);
+                            }
+                        }
                         const srcDepth = varScope.get(fi.src);
+                        if (srcDepth === undefined && !/^t\d+$/.test(fi.dst) && !globals.has(fi.dst) && !/^-?\d+$/.test(fi.src)) {
+                            borrowMovs.add(fi);
+                        }
                         if (srcDepth !== undefined) {
                             varScope.delete(fi.src); // src no longer owns the allocation
+                            if (fieldsOf.has(fi.src)) fieldsOf.set(fi.dst, fieldsOf.get(fi.src)!);
+                            if (ownerType.has(fi.src)) ownerType.set(fi.dst, ownerType.get(fi.src)!);
+                            if (globals.has(fi.dst)) globalStores.add(fi);
                             if (!globals.has(fi.dst)) {
                                 const ownerDepth = /^t\d+$/.test(fi.dst) ? srcDepth : (declDepth.get(fi.dst) ?? srcDepth);
                                 varScope.set(fi.dst, ownerDepth);
                             }
+                            if (!/^t\d+$/.test(fi.dst)) heldBy.set(fi.src, fi.dst); // src is now held by dst
                         }
                     }
                     // array_store transfers ownership of src into the array — don't free src separately
-                    if (fi.op === "array_store") {
+                    // push/insert move the value into the array, like a store (nothing is overwritten)
+                    if (fi.op === "array_push" || fi.op === "array_insert" || fi.op === "map_set") {
+                        const holder = heldBy.get(fi.src);
                         varScope.delete(fi.src);
+                        if (holder) varScope.delete(holder);
+                    }
+                    if (fi.op === "array_store" || fi.op === "field_store") {
+                        const holder = heldBy.get(fi.src);
+                        if ((varScope.has(fi.src) || (holder !== undefined && varScope.has(holder))))  {
+                            heapStores.add(fi);
+                        }
+                        varScope.delete(fi.src)
+                        if (holder) varScope.delete(holder); // the holder no longer owns it either
                     }
                 }
             }
 
             const allHeapVars = new Set(varScope.keys());
+            // heap owners that sometimes hold a borrowed value: their frees check __owns_<name>
+            const mixedVars = new Set<string>();
+            for (const fi of borrowMovs) if (fi.op === "mov" && allHeapVars.has(fi.dst)) mixedVars.add(fi.dst);
+            let ownSkipCount = 0;
+            const guardedFree = (v: string) => {
+                if (!mixedVars.has(v)) { result.push(freeOp(v)); return; }
+                const skip = `__own_skip_${ownSkipCount++}`;
+                result.push({ op: "jz", cond: `__owns_${v}`, target: skip });
+                result.push(freeOp(v));
+                result.push({ op: "label", name: skip });
+            };
 
             // Build forward mov chain: src -> final owner (to resolve ret value through movs)
             const movForward = new Map<string, string>();
@@ -396,47 +492,76 @@ export function insertFrees(ir: IR[]): IR[] {
             }
 
             let loopDepth = 0;
+            let oldCount = 0
             const loopLabelStack: string[] = [];
-            const freedVars = new Set<string>();
-            // Track which heap vars have been allocated so far (in linear order).
-            // Only free vars that have been seen before the ret on this path.
-            const allocatedSoFar = new Set<string>();
+            const paramsAwaitingCopy = new Set<string>();
 
             for (const fi of fnInstrs) {
-                const allocDst = isHeapAlloc(fi);
-                if (allocDst && allHeapVars.has(allocDst)) allocatedSoFar.add(allocDst);
 
                 // The frees below are placed by position, not by path, so a variable can
                 // be freed on a path where it was never allocated. Start every heap owner
                 // as NULL (before the args are read) so that is a free(NULL) no-op.
+                if (fi.op === "mov" && globalStores.has(fi)) result.push(freeOp(fi.dst));
+                if (fi.op === "arg") paramsAwaitingCopy.add(fi.dst);
+                if (fi.op === "mov" && allHeapVars.has(fi.dst) && !/^t\d+$/.test(fi.dst)) {
+                    if (paramsAwaitingCopy.has(fi.dst)) {
+                        paramsAwaitingCopy.delete(fi.dst);
+                    } else { guardedFree(fi.dst) }
+                    if (mixedVars.has(fi.dst)) {
+                        result.push(fi);
+                        result.push({ op: "const", dst: `__owns_${fi.dst}`, value: borrowMovs.has(fi) ? 0 : 1 });
+                        continue;
+                    }
+                }
+                if (fi.op === "array_push" || fi.op === "array_insert" || fi.op === "map_set") {
+                    result.push(fi);
+                    const holder = heldBy.get(fi.src) ?? fi.src;
+                    if (allHeapVars.has(holder)) result.push({ op: "const", dst: holder, value: 0 });
+                    continue;
+                }
+                if (fi.op === "array_store" || fi.op === "field_store") {
+                    if (heapStores.has(fi)) {
+                        const old = `__old_${oldCount++}`;
+                        result.push(fi.op === "array_store"
+                            ? { op: "array_load", dst: old, arr: fi.arr, index: fi.index }
+                            : { op: "field_load", dst: old, base: fi.base, offset: fi.offset });
+                        result.push({ op: "free", addr: old, type: fi.op === "array_store" ? fi.elemType : fi.fieldType });
+                    }
+
+                    result.push(fi);
+                    const holder = heldBy.get(fi.src) ?? fi.src;
+                    if (holder && allHeapVars.has(holder)) result.push({ op: "const", dst: holder, value: 0 });
+                    continue;
+                }
                 if (fi.op === "enter") {
                     result.push(fi);
                     for (const v of allHeapVars) result.push({ op: "const", dst: v, value: 0 });
+                    for (const v of mixedVars) result.push({ op: "const", dst: `__owns_${v}`, value: 0 });
                     continue;
                 }
 
-                if (fi.op === "label" && fi.name.startsWith("while_start")) {
+                if (fi.op === "label" && isLoopStart(fi.name)) {
                     loopDepth++;
                     loopLabelStack.push(fi.name);
                     result.push(fi);
                     continue;
                 }
 
-                if (fi.op === "jmp" && loopLabelStack.length > 0 && fi.target === loopLabelStack[loopLabelStack.length - 1]) {
-                    for (const [v, d] of varScope) {
-                        if (d === loopDepth && !freedVars.has(v)) {
-                            if (array2dRows.has(v)) {
-                                result.push({ op: "array_free_2d", arr: v, rows: array2dRows.get(v)! });
-                            } else {
-                                result.push({ op: "free", addr: v });
-                            }
-                            // an iteration that skips the allocation must not free it again
-                            result.push({ op: "const", dst: v, value: 0 });
-                            freedVars.add(v);
-                        }
-                    }
+                if (fi.op === "label" && loopLabelStack.length > 0 && fi.name === loopEnd.get(loopLabelStack[loopLabelStack.length - 1])) {
                     loopLabelStack.pop();
                     loopDepth--;
+                    result.push(fi);
+                    continue;
+                }
+
+                const curLoop = loopLabelStack[loopLabelStack.length - 1];
+                if (fi.op === "jmp" && curLoop !== undefined && (fi.target === curLoop || fi.target === loopEnd.get(curLoop))) {
+                    for (const [v, d] of varScope) {
+                        if (d === loopDepth) {
+                            guardedFree(v)
+                            result.push({ op: "const", dst: v, value: 0 });
+                        }
+                    }
                     result.push(fi);
                     continue;
                 }
@@ -445,12 +570,8 @@ export function insertFrees(ir: IR[]): IR[] {
                     const returnedVal = fi.value;
                     const returnedOwner = returnedVal ? resolveOwner(returnedVal) : undefined;
                     for (const v of allHeapVars) {
-                        if (!freedVars.has(v) && v !== returnedOwner && allocatedSoFar.has(v)) {
-                            if (array2dRows.has(v)) {
-                                result.push({ op: "array_free_2d", arr: v, rows: array2dRows.get(v)! });
-                            } else {
-                                result.push({ op: "free", addr: v });
-                            }
+                        if (v !== returnedOwner) {
+                            guardedFree(v)
                         }
                     }
                 }
