@@ -217,6 +217,12 @@ const serverTests = [
         const f = write("s2.l", main(`print(1);`));
         await c.compilerDiagnostics(c.open(f), none);
     } },
+    { name: "server: every error in a file is shown", run: async c => {
+        const f = write("s1b.l", main(lines(`var int x = "a";`, "print(nope);", `var string s = 5;`)));
+        const ds = await c.compilerDiagnostics(c.open(f), some);
+        expectEq(ds.map(d => d.range.start.line), [1, 2, 3], "lines");
+        expectMatch(ds[1].message, /^Undefined identifier: nope$/, "second message");
+    } },
     { name: "server: an error introduced by a save is shown", run: async c => {
         const f = write("s3.l", main(`print(1);`));
         await c.compilerDiagnostics(c.open(f), none);

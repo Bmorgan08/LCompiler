@@ -50,9 +50,9 @@ node dist/Main.js hello.l hello    # compiles to ./hello
 | `--asm`     | Print the generated assembly           |
 | `--tokens`  | Print the token stream                 |
 | `--verbose` | Print all of the above                 |
-| `--check`   | Only check the program: report the first error and exit 1, or exit 0; no files are written |
+| `--check`   | Only check the program: report its errors and exit 1, or exit 0; no files are written |
 
-Errors include the source location: `line:col: message`. The VS Code extension runs `--check` whenever a file is opened or saved and shows the error in the editor.
+Errors include the source location: `line:col: message`. Every type and memory-safety error in the program is reported, one per line; a syntax error stops the compiler at the first one, since the code after it can't be read reliably. The VS Code extension runs `--check` whenever a file is opened or saved and shows the errors in the editor.
 
 ---
 

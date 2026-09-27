@@ -8,6 +8,23 @@ function err(node: Node, msg: string): never {
     throw new Error(prefix + msg);
 }
 
+// every error found, in order; checking carries on after an error at the next statement
+export const errors: string[] = [];
+
+// validates one statement, recording an error instead of stopping. A declaration that failed still
+// defines its variable, with an unknown type, so later uses of it aren't checked and don't each
+// report an error of their own
+function validateStatement(c: Node, scope: Scope) {
+    try {
+        validate(c, scope);
+    } catch (e: any) {
+        if (!errors.includes(e.message)) errors.push(e.message);   // loop bodies are checked twice
+        if (c.type === "VarDecl" && !scope.symbols.has(c.value!)) {
+            define(scope, { name: c.value!, kind: "var", type: "unknown" });
+        }
+    }
+}
+
 // ── Types ──
 // Scalars (int, float, bool, char) and strings are values: assigning one copies it. Arrays,
 // structs and tuples are heap values that variables share by pointer.
@@ -956,7 +973,7 @@ export function validate(node: Node, scope: Scope) {
                     n.children.forEach(methods);
                 })(c);
             }
-            node.children.forEach(c => validate(c, scope));
+            node.children.forEach(c => validateStatement(c, scope));
             break;
 
         case "Function": {
@@ -978,13 +995,13 @@ export function validate(node: Node, scope: Scope) {
                     symScope.set(resolve(c.value!, fnScope)!, fnScope);
                 }
             });
-            node.children.forEach(c => validate(c, fnScope));
+            node.children.forEach(c => validateStatement(c, fnScope));
             break;
         }
 
         case "Block": {
             const blockScope = createScope(scope);
-            node.children.forEach(c => validate(c, blockScope));
+            node.children.forEach(c => validateStatement(c, blockScope));
             break;
         }
 
@@ -1456,4 +1473,4 @@ export function validate(node: Node, scope: Scope) {
     }
 }
 
-module.exports = { validate };
+module.exports = { validate, errors };

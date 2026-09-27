@@ -1478,6 +1478,35 @@ const tests = [
       source: `function double(int x): int { return x * 2; }\n` + main(lines("var string s = \"hello\";", "var int len = len(s);", "var int double = double(len);", "print(len);", "print(double);", "print(len(\"ab\"));")),
       expected: "5\n10\n2" },
 
+    // ── Several errors in one program ────────────────────────────────────
+    // (the regexes match all of stderr, so they also check no other errors are reported)
+
+    { name: "errors: separate mistakes are all reported, in order",
+      source: main(lines("var int x = \"a\";", "var string s = 5;", "print(nope);")),
+      shouldError: true, errorMatch: /^Error: 2:\d+: Type annotation mismatch: declared int, inferred string\nError: 3:\d+: Type annotation mismatch: declared string, inferred int\nError: 4:\d+: Undefined identifier: nope\n$/ },
+    { name: "errors: a failed declaration isn't reported again where it's used",
+      source: main(lines("var int x = \"a\";", "print(x + 1);", "var y = x * 2;", "print(y);")),
+      shouldError: true, errorMatch: /^Error: 2:\d+: Type annotation mismatch[^\n]*\n$/ },
+    { name: "errors: a mistake in a loop body is reported once",
+      source: main(lines("var i = 0;", "while (i < 3) {", "    print(nope);", "    i++;", "}")),
+      shouldError: true, errorMatch: /^Error: 4:\d+: Undefined identifier: nope\n$/ },
+    { name: "errors: mistakes in different functions are all reported",
+      source: lines("function f(int a): int { return \"x\"; }", "function g(): int { return missing(); }") + "\n" + main(`print(f(1) + g());`),
+      shouldError: true, errorMatch: /^Error: 1:[^\n]*\nError: 2:\d+: Undefined function: missing\n$/ },
+    { name: "errors: mistakes in a method and in main are both reported",
+      source: lines("struct P {", "    var n: int;", "    fn get(): int { return this.nope; }", "}") + "\n" + main(lines("var p = P { n: 1 };", "print(p.get(2));")),
+      shouldError: true, errorMatch: /^Error: 3:[^\n]*nope[^\n]*\nError: 7:\d+: [^\n]*expects 0 args, got 1\n$/ },
+    { name: "errors: checking carries on after a nested block",
+      source: main(lines("var i = 0;", "while (i < 2) {", "    if (i == 1) {", "        var string s = 1;", "    }", "    i++;", "}", "print(undefinedThing);")),
+      shouldError: true, errorMatch: /^Error: 5:[^\n]*\nError: 9:\d+: Undefined identifier: undefinedThing\n$/ },
+    { name: "errors: argument and ownership mistakes are reported together",
+      source: `function add(int a, int b): int { return a + b; }\n` +
+              main(lines("print(add(\"q\", 2));", "var int[][] m = new int[2][2];", "var int[] row = new int[2];", "m[0] = row;", "row[0] = 1;")),
+      shouldError: true, errorMatch: /^Error: 3:\d+: Argument 1 of add[^\n]*\nError: 7:\d+: row was stored into an array or struct[^\n]*\n$/ },
+    { name: "errors: a syntax error still stops at the first",
+      source: main(lines("var x = ;", "var int y = \"a\";")),
+      shouldError: true, errorMatch: /^Error: [^\n]*\n$/ },
+
     // ── Compile errors ───────────────────────────────────────────────────
 
     { name: "error: undefined variable", source: main(`print(nope);`), shouldError: true, errorMatch: /Undefined/ },

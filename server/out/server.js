@@ -1008,18 +1008,20 @@ function refreshDocument(doc) {
 // its error, "Error: line:col: message", is shown until the next save.
 const COMPILER = path.resolve(__dirname, "..", "..", "dist", "Main.js");
 const running = new Map();   // uri -> the check in progress, killed if the file is saved again
+// one diagnostic per "Error: line:col: message" in the compiler's output (a message can run over
+// several lines; an error without a position goes on the first line)
 function parseCompilerError(stderr) {
-    const text = stderr.trim().replace(/^Error:\s*/, "");
-    if (!text) return [];
-    const m = /^(\d+):(\d+):\s*([\s\S]*)$/.exec(text);
-    const line = m ? Math.max(0, Number(m[1]) - 1) : 0;
-    const col = m ? Math.max(0, Number(m[2]) - 1) : 0;
-    return [{
-        range: node_1.Range.create(line, col, line, col + 1),
-        message: m ? m[3] : text,
-        severity: node_1.DiagnosticSeverity.Error,
-        source: "L compiler",
-    }];
+    return stderr.split(/^Error:\s*/m).map(t => t.trim()).filter(Boolean).map(text => {
+        const m = /^(\d+):(\d+):\s*([\s\S]*)$/.exec(text);
+        const line = m ? Math.max(0, Number(m[1]) - 1) : 0;
+        const col = m ? Math.max(0, Number(m[2]) - 1) : 0;
+        return {
+            range: node_1.Range.create(line, col, line, col + 1),
+            message: m ? m[3] : text,
+            severity: node_1.DiagnosticSeverity.Error,
+            source: "L compiler",
+        };
+    });
 }
 function checkWithCompiler(doc) {
     if (!fs.existsSync(COMPILER)) return;   // the compiler hasn't been built (npx tsc)

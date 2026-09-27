@@ -5,7 +5,7 @@ import { LexerWithPos } from "./Modules/Lexer";
 import { parseWithPos } from "./Modules/Parser";
 import { createScope, define } from "./Modules/Scope";
 import { declare } from "./Modules/Declare";
-import { validate } from "./Modules/Validate";
+import { validate, errors } from "./Modules/Validate";
 import { IRGen, printIR } from "./Modules/IR";
 import { emitNASM } from "./Modules/Emitter";
 import { copyProp, DCE, fold, cse, insertFrees } from "./Modules/Optimize";
@@ -15,7 +15,7 @@ const irOnly = process.argv.includes("--ir");
 const astOnly = process.argv.includes("--ast");
 const asm = process.argv.includes("--asm");
 const tokensOnly = process.argv.includes("--tokens");
-// --check: report the first error (as "Error: line:col: message") and exit 1, or exit 0, without
+// --check: report the errors (each as "Error: line:col: message") and exit 1, or exit 0, without
 // writing any files; the language server runs this on save
 const checkOnly = process.argv.includes("--check");
 
@@ -173,6 +173,11 @@ try {
     validate(optimizedAst, globalScope);
 } catch (e: any) {
     die(e.message);
+}
+// every type and memory-safety error is reported (syntax errors still stop at the first)
+if (errors.length) {
+    for (const msg of errors) console.error(`Error: ${locate(msg)}`);
+    process.exit(1);
 }
 
 let IR: ReturnType<typeof IRGen>;
