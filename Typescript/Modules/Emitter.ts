@@ -1,7 +1,10 @@
 import { IR } from "./IR";
 import { tupleTypeParts } from "./Scope";
 
-export function emitNASM(instructions: IR[]): string {
+// kernel: the program is a kernel (--kernel). Globals are set up at the start of kernel_main, and
+// a runtime error calls the kernel runtime's lrt_kernel_fail (which calls kernel_panic) instead of
+// writing to stderr with a Linux system call
+export function emitNASM(instructions: IR[], options: { kernel?: boolean } = {}): string {
     const nasmLines: string[] = [
         "section .data",
         "fmt db '%ld', 10, 0",
@@ -63,6 +66,11 @@ export function emitNASM(instructions: IR[]): string {
         "extern gfx_c_rect_border",
         ""];
 
+    // functions defined in assembly or C (extern fn)
+    for (const instr of instructions) {
+        if (instr.op === "extern_decl") nasmLines.splice(nasmLines.indexOf("section .text") + 1, 0, `extern ${instr.name}`);
+    }
+
     // Identify global variables: instructions emitted before the first function enter.
     // Collect their names so we can store them in .bss and access them RIP-relative.
     const globalVars = new Set<string>();
@@ -70,6 +78,10 @@ export function emitNASM(instructions: IR[]): string {
     // may be emitted after functions that use them, so work this out up front.
     const globalStrings = new Set<string>();
     const globalFloats = new Set<string>();
+    // globals set to a plain number (var u64 next_page = 0x400000;): stored in .data with that value
+    // instead of being set by code at the start of main. They hold it from the very start, so a
+    // kernel's hooks (called while other globals are still being set up) can rely on them
+    const staticGlobals = new Map<string, string>();
     {
         const firstEnterIdx = instructions.findIndex(i => i.op === "enter");
         if (firstEnterIdx > 0) {
@@ -80,6 +92,18 @@ export function emitNASM(instructions: IR[]): string {
                 }
             }
             const globalInits = instructions.splice(0, firstEnterIdx);
+            const writes = new Map<string, number>();
+            for (const instr of globalInits) {
+                const d = (instr as any).dst;
+                if (typeof d === "string") writes.set(d, (writes.get(d) ?? 0) + 1);
+            }
+            for (let k = globalInits.length - 1; k >= 0; k--) {
+                const instr = globalInits[k];
+                if (instr.op === "mov" && globalVars.has(instr.dst) && writes.get(instr.dst) === 1 && /^-?\d+$/.test(String(instr.src))) {
+                    staticGlobals.set(instr.dst, String(instr.src));
+                    globalInits.splice(k, 1);
+                }
+            }
             const strs = new Set<string>();
             const floats = new Set<string>();
             for (const instr of globalInits) {
@@ -104,7 +128,8 @@ export function emitNASM(instructions: IR[]): string {
                 if (strs.has(g)) globalStrings.add(g);
                 if (floats.has(g)) globalFloats.add(g);
             }
-            const mainEnterIdx = instructions.findIndex(i => i.op === "enter" && (i as any).name === "main");
+            const entry = options.kernel ? "kernel_main" : "main";
+            const mainEnterIdx = instructions.findIndex(i => i.op === "enter" && (i as any).name === entry);
             const insertAfter = mainEnterIdx >= 0 ? mainEnterIdx + 1 : 1;
             instructions.splice(insertAfter, 0, ...globalInits);
         }
@@ -570,6 +595,20 @@ export function emitNASM(instructions: IR[]): string {
                 break;
             }
             case "call": {
+                if (/^(in|out)[bwl]$/.test(instr.fn)) {
+                    // port I/O: the port goes in dx; in reads into al/ax/eax, out writes from it
+                    const reg = ({ b: "al", w: "ax", l: "eax" } as Record<string, string>)[instr.fn[instr.fn.length - 1]];
+                    nasmLines.push(`mov rdx, ${indexOperand(instr.args[0])}`);
+                    if (instr.fn.startsWith("out")) {
+                        nasmLines.push(`mov rax, ${indexOperand(instr.args[1])}`);
+                        nasmLines.push(`out dx, ${reg}`);
+                    } else {
+                        nasmLines.push(`xor eax, eax`);
+                        nasmLines.push(`in ${reg}, dx`);
+                        if (instr.dst) nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                    }
+                    break;
+                }
                 if (instr.fn === "print_int" || instr.fn === "print_str" || instr.fn === "print") {
                     const arg = instr.args[0];
                     const slot = loadOperand(arg);
@@ -809,6 +848,14 @@ export function emitNASM(instructions: IR[]): string {
                 usesUnsetFail = true;
                 nasmLines.push(`__div_ok_${n}:`);
                 nasmLines.push(`mov rax, [rbp - ${a}]`);
+                if (instr.unsigned) {
+                    // u64: unsigned division (no INT64_MIN / -1 case)
+                    nasmLines.push(`xor edx, edx`);
+                    nasmLines.push(`div rcx`);
+                    if (instr.op === "mod") nasmLines.push(`mov rax, rdx`);
+                    nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                    break;
+                }
                 nasmLines.push(`cmp rcx, -1`);
                 nasmLines.push(`jne __div_normal_${n}`);
                 nasmLines.push(instr.op === "div" ? `neg rax` : `xor eax, eax`);
@@ -863,6 +910,85 @@ export function emitNASM(instructions: IR[]): string {
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 break;
             }
+            case "sar": {
+                const a = loadOperand(instr.a);
+                const b = loadOperand(instr.b);
+                nasmLines.push(`mov rax, [rbp - ${a}]`);
+                nasmLines.push(`mov rcx, [rbp - ${b}]`);
+                nasmLines.push(`sar rax, cl`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+            case "bnot": {
+                const src = loadOperand(instr.src);
+                nasmLines.push(`mov rax, [rbp - ${src}]`);
+                nasmLines.push(`not rax`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+            case "trunc": {
+                // keep the value widened to 64 bits, zero- or sign-extended from its size
+                const src = loadOperand(instr.src);
+                nasmLines.push(`mov rax, [rbp - ${src}]`);
+                nasmLines.push(({
+                    u8: "movzx eax, al", u16: "movzx eax, ax", u32: "mov eax, eax",
+                    i8: "movsx rax, al", i16: "movsx rax, ax", i32: "movsxd rax, eax",
+                } as Record<string, string>)[instr.type] ?? "");
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+            case "mem_load": {
+                // raw memory: read exactly `size` bytes, widened to 64 bits. The address may be a
+                // literal (copyProp puts a pointer's constant value here), so load it as an operand
+                nasmLines.push(`mov rax, [rbp - ${loadOperand(instr.addr)}]`);
+                const load: Record<string, string> = {
+                    "1u": "movzx eax, byte [rax]", "1s": "movsx rax, byte [rax]",
+                    "2u": "movzx eax, word [rax]", "2s": "movsx rax, word [rax]",
+                    "4u": "mov eax, dword [rax]", "4s": "movsxd rax, dword [rax]",
+                    "8u": "mov rax, qword [rax]", "8s": "mov rax, qword [rax]",
+                };
+                nasmLines.push(load[`${instr.size}${instr.signed ? "s" : "u"}`]);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+            case "mem_store": {
+                const src = loadOperand(instr.src);
+                nasmLines.push(`mov rax, [rbp - ${loadOperand(instr.addr)}]`);
+                nasmLines.push(`mov rcx, [rbp - ${src}]`);
+                nasmLines.push(({ 1: "mov byte [rax], cl", 2: "mov word [rax], cx", 4: "mov dword [rax], ecx", 8: "mov qword [rax], rcx" } as Record<number, string>)[instr.size]);
+                break;
+            }
+            case "global_addr": {
+                nasmLines.push(`lea rax, [rel __g_${instr.name}]`);
+                nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
+                break;
+            }
+            case "extern_decl":
+                break;   // declared at the top (see externNames)
+            case "isr_stub": {
+                // The CPU jumps here with (error code,) rip, cs, rflags, rsp, ss on the stack. Save every
+                // register and the SSE state (the handler is ordinary L code, which may use any of them),
+                // call the body with the frame and error code, restore, drop the error code, iretq
+                const regs = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+                const saved = regs.length * 8;
+                nasmLines.push(`global $${instr.name}`);
+                nasmLines.push(`$${instr.name}:`);
+                for (const r of regs) nasmLines.push(`push ${r}`);
+                nasmLines.push(`mov rbx, rsp`);                          // rbx survives the call
+                nasmLines.push(`and rsp, -16`);
+                nasmLines.push(`sub rsp, 512`);
+                nasmLines.push(`fxsave64 [rsp]`);
+                nasmLines.push(`lea rdi, [rbx + ${saved + (instr.errorCode ? 8 : 0)}]`);   // the frame
+                if (instr.errorCode) nasmLines.push(`mov rsi, [rbx + ${saved}]`);         // the error code
+                nasmLines.push(`cld`);
+                nasmLines.push(`call $${instr.fn}`);
+                nasmLines.push(`fxrstor64 [rsp]`);
+                nasmLines.push(`mov rsp, rbx`);
+                for (const r of [...regs].reverse()) nasmLines.push(`pop ${r}`);
+                if (instr.errorCode) nasmLines.push(`add rsp, 8`);
+                nasmLines.push(`iretq`);
+                break;
+            }
             case "not": {
                 const src = loadOperand(instr.src);
                 nasmLines.push(`mov rax, [rbp - ${src}]`);
@@ -913,7 +1039,7 @@ export function emitNASM(instructions: IR[]): string {
                 const b = loadOperand(instr.b);
                 nasmLines.push(`mov rax, [rbp - ${a}]`);
                 nasmLines.push(`cmp rax, [rbp - ${b}]`);
-                nasmLines.push(`setl al`);
+                nasmLines.push(instr.unsigned ? `setb al` : `setl al`);
                 nasmLines.push(`movzx rax, al`);
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 break;
@@ -923,7 +1049,7 @@ export function emitNASM(instructions: IR[]): string {
                 const b = loadOperand(instr.b);
                 nasmLines.push(`mov rax, [rbp - ${a}]`);
                 nasmLines.push(`cmp rax, [rbp - ${b}]`);
-                nasmLines.push(`setle al`);
+                nasmLines.push(instr.unsigned ? `setbe al` : `setle al`);
                 nasmLines.push(`movzx rax, al`);
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 break;
@@ -933,7 +1059,7 @@ export function emitNASM(instructions: IR[]): string {
                 const b = loadOperand(instr.b);
                 nasmLines.push(`mov rax, [rbp - ${a}]`);
                 nasmLines.push(`cmp rax, [rbp - ${b}]`);
-                nasmLines.push(`setg al`);
+                nasmLines.push(instr.unsigned ? `seta al` : `setg al`);
                 nasmLines.push(`movzx rax, al`);
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 break;
@@ -943,7 +1069,7 @@ export function emitNASM(instructions: IR[]): string {
                 const b = loadOperand(instr.b);
                 nasmLines.push(`mov rax, [rbp - ${a}]`);
                 nasmLines.push(`cmp rax, [rbp - ${b}]`);
-                nasmLines.push(`setge al`);
+                nasmLines.push(instr.unsigned ? `setae al` : `setge al`);
                 nasmLines.push(`movzx rax, al`);
                 nasmLines.push(`mov ${memRef(instr.dst)}, rax`);
                 break;
@@ -1279,7 +1405,15 @@ export function emitNASM(instructions: IR[]): string {
         nasmLines.push(`ret`);
     }
 
-    {
+    if (options.kernel) {
+        // a runtime error in a kernel: lrt_kernel_fail(message, length) calls kernel_panic and halts
+        nasmLines.push(`__unset_fail:`);
+        nasmLines.push(`and rsp, -16`);
+        nasmLines.push(`mov rdi, rsi`);
+        nasmLines.push(`mov rsi, rdx`);
+        nasmLines.push(`call lrt_kernel_fail`);
+        nasmLines.splice(nasmLines.indexOf("section .text") + 1, 0, "extern lrt_kernel_fail");
+    } else {
         // a runtime error (a field never set, division by zero): rsi = message, rdx = its length.
         // Flush what the program printed, write the message to stderr and exit with status 1
         nasmLines.push(`__unset_fail:`);
@@ -1344,7 +1478,12 @@ export function emitNASM(instructions: IR[]): string {
         nasmLines.push("section .bss");
         nasmLines.push("alignb 8")
         for (const name of globalVars) {
-            nasmLines.push(`__g_${name}: resq 1`);
+            if (!staticGlobals.has(name)) nasmLines.push(`__g_${name}: resq 1`);
+        }
+        if (staticGlobals.size) {
+            nasmLines.push("section .data");
+            nasmLines.push("align 8");
+            for (const [name, value] of staticGlobals) nasmLines.push(`__g_${name}: dq ${value}`);
         }
     }
 

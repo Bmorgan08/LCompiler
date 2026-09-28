@@ -12,6 +12,12 @@ output
 # and its temporary file if a build is interrupted
 Typescript/runtime/lrt.o.*.tmp
 
+# local experiments (a mock-up kernel); the OS itself lives in its own repo (apollOS)
+/examples/
+
+# the boot code the kernel tests use is source, not compiler output
+!Test/kernel/boot.asm
+
 # ramanujan.l capability test (local only) and its binary
 /ramanujan
 /ramanujan.l

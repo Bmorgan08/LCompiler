@@ -16,6 +16,7 @@
 //   bug        id from known-bugs.js: the test documents a known bug and is expected to fail.
 //              If it passes, it is reported as XPASS so the marker can be removed.
 //   gfx        needs a display; only run with --gfx
+//   libc       calls C library functions nolibc.c doesn't have (through extern fn); skipped with --nolibc
 //
 // Usage: node Test/<Suite>.js [filter] [--verbose] [--memcheck] [--leaks] [--gfx] [--bugs] [--nolibc]
 //   filter      only run tests whose name contains this text
@@ -168,6 +169,7 @@ async function runSuite(title, tests) {
         (!filter || t.name.includes(filter)) &&
         (!t.gfx || flags.gfx) &&
         (!flags.nolibc || !/^\s*import\s+graphics\b/m.test(t.source ?? "")) &&   // graphics needs the C library
+        (!flags.nolibc || !t.libc) &&
         (!flags.bugsOnly || t.bug));
     const skipped = tests.length - selected.length;
 

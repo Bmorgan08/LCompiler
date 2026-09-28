@@ -53,7 +53,14 @@ type NodeType =
     | "TupleAccess"
     | "FuncRef"
     | "Lambda"
-    | "AsmBlock";
+    | "AsmBlock"
+    | "Cast"            // u8(x), int(x), ptr<u16>(x): varType is the target type
+    | "SizeOf"          // sizeof(T): varType is T (Validate turns it into a Number)
+    | "PtrLoad"         // made by Validate from p[i], p[i].f, p.f on a pointer: children [pointer, index]
+    | "PtrStore"        // p[i] = v and friends: children [pointer, index, value]
+    | "AddrOf"          // made by Validate from addr(x): value is a function or global name, or children [pointer, index]
+    | "PackedStructDef" // packed struct S { var f: u16; ... }: fields laid out exactly, no header
+    | "ExternFn";       // extern fn name(u64 a): u8; a function defined outside L (assembly or C)
 
 export interface Node {
     type: NodeType;
@@ -64,7 +71,20 @@ export interface Node {
     isConst?: boolean;
     line?: number;
     col?: number;
+    // filled in by Validate for IR.ts:
+    ptr?: { scale: number, offset: number };   // pointer maths / PtrLoad / PtrStore: element size and field offset
+    truncTo?: string;                           // a compound assignment or ++/-- on a sized variable wraps to this type
+    unsigned?: boolean;                         // a comparison, division or shift on u64 values
+    compound?: boolean;                         // the `a[i] + v` made from `a[i] += v` (wraps into a sized slot)
+    interrupt?: boolean;                        // interrupt fn: called by the CPU through the IDT, not by L code
 }
+
+// the sized integer types: size in bytes and whether they are signed (int is a signed 8-byte integer)
+export const SIZED_INTS: Record<string, { size: number, signed: boolean }> = {
+    u8: { size: 1, signed: false }, u16: { size: 2, signed: false }, u32: { size: 4, signed: false }, u64: { size: 8, signed: false },
+    i8: { size: 1, signed: true }, i16: { size: 2, signed: true }, i32: { size: 4, signed: true },
+};
+const BASIC_TYPES = ["int", "string", "bool", "float", "char", "void", "unknown", ...Object.keys(SIZED_INTS)];
 
 function peek(t: Token[]): string { return t[0]?.value ?? ""; }
 function peekTok(t: Token[]): Token | undefined { return t[0]; }
@@ -202,6 +222,34 @@ function parseExpression(tokens: Token[]): Node {
         }
 
         if (t === "true") return { type: "Number", value: "1", varType: "bool", children: [], line: tok.line, col: tok.col };
+
+        // casts: u8(x), int(x), ptr<u16>(x)
+        if ((t in SIZED_INTS || t === "int") && peek(tokens) === "(") {
+            eat(tokens);
+            const value = parseExpression(tokens);
+            if (peek(tokens) !== ")") err(`Expected ')' after the value in ${t}(...)`, peekTok(tokens));
+            eat(tokens);
+            return { type: "Cast", varType: t, children: [value], line: tok.line, col: tok.col };
+        }
+        if (t === "ptr" && peek(tokens) === "<") {
+            tokens.unshift(tok);
+            const target = parseTypeAnnotation(tokens)!;
+            if (peek(tokens) !== "(") err(`Expected '(' after ${target}: a pointer type is used as a cast, ${target}(address)`, peekTok(tokens));
+            eat(tokens);
+            const value = parseExpression(tokens);
+            if (peek(tokens) !== ")") err(`Expected ')' after the value in ${target}(...)`, peekTok(tokens));
+            eat(tokens);
+            return { type: "Cast", varType: target, children: [value], line: tok.line, col: tok.col };
+        }
+        // sizeof(T): the size in bytes of a type (a packed struct, a sized integer, a pointer, ...)
+        if (t === "sizeof" && peek(tokens) === "(") {
+            eat(tokens);
+            const target = parseTypeAnnotation(tokens);
+            if (!target) err(`Expected a type in sizeof(...)`, peekTok(tokens));
+            if (peek(tokens) !== ")") err(`Expected ')' after the type in sizeof(...)`, peekTok(tokens));
+            eat(tokens);
+            return { type: "SizeOf", varType: target, children: [], line: tok.line, col: tok.col };
+        }
         if (t === "none") return { type: "None", children: [], line: tok.line, col: tok.col };
 
         // a map literal: {} or { key: value, ... }
@@ -242,6 +290,10 @@ function parseExpression(tokens: Token[]): Node {
 
         if (t === "!") {
             return { type: "Unary", value: "!", children: [primary()], line: tok.line, col: tok.col };
+        }
+
+        if (t === "~") {
+            return { type: "Unary", value: "~", children: [primary()], line: tok.line, col: tok.col };
         }
 
         if (t === "++" || t === "--") {
@@ -339,7 +391,7 @@ function parseExpression(tokens: Token[]): Node {
     function assignment(): Node {
         const left = primary();
 
-        const compOps = ["+=", "-=", "*=", "/=", "%="];
+        const compOps = COMPOUND_OPS;
         if (compOps.includes(peek(tokens))) {
             const op = eat(tokens);
             const right = binary(primary());
@@ -358,11 +410,13 @@ function parseExpression(tokens: Token[]): Node {
     }
 
     function binary(left: Node, min = 0): Node {
+        // C's precedence: || && | ^ & (== !=) (< <= > >=) (<< >>) (+ -) (* / %)
         const prec: Record<string, number> = {
-            "||": 1, "&&": 2,
-            "==": 3, "!=": 3, "<": 3, ">": 3, "<=": 3, ">=": 3,
-            "+": 4, "-": 4,
-            "*": 5, "/": 5, "%": 5,
+            "||": 1, "&&": 2, "|": 3, "^": 4, "&": 5,
+            "==": 6, "!=": 6, "<": 7, ">": 7, "<=": 7, ">=": 7,
+            "<<": 8, ">>": 8,
+            "+": 9, "-": 9,
+            "*": 10, "/": 10, "%": 10,
         };
 
         while (true) {
@@ -383,8 +437,33 @@ function parseExpression(tokens: Token[]): Node {
     return binary(assignment());
 }
 
+const COMPOUND_OPS = ["+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="];
+
+// the '>' closing a type. The lexer reads '>>' as one token (a shift), so in ptr<ptr<u8>> the
+// first '>' of it closes the inner type and the second is left for the outer one
+function eatTypeClose(tokens: Token[], what: string) {
+    if (peek(tokens) === ">>") { tokens[0] = { ...tokens[0], value: ">", col: tokens[0].col + 1 }; return; }
+    if (peek(tokens) !== ">") err(`Expected '>' after ${what}`, peekTok(tokens));
+    eat(tokens);
+}
+
+// an optional [] after a type: u8[], ptr<u8>[]
+function arraySuffix(tokens: Token[], t: string): string {
+    if (peek(tokens) === "[" && tokens[1]?.value === "]") { eat(tokens); eat(tokens); return t + "[]"; }
+    return t;
+}
+
 function parseTypeAnnotation(tokens: Token[]): Ltype | undefined {
     const next = peek(tokens);
+    // a pointer type: ptr<u16>, ptr<IdtEntry>, ptr<ptr<u8>>
+    if (next === "ptr" && tokens[1]?.value === "<") {
+        eat(tokens);
+        eat(tokens);
+        const target = parseTypeAnnotation(tokens);
+        if (!target) err(`Expected a type in ptr<...>`, peekTok(tokens));
+        eatTypeClose(tokens, "a pointer's element type");
+        return arraySuffix(tokens, `ptr<${target}>`) as Ltype;
+    }
     // a map type: map<string, int>
     if (next === "map" && tokens[1]?.value === "<") {
         eat(tokens);
@@ -395,8 +474,7 @@ function parseTypeAnnotation(tokens: Token[]): Ltype | undefined {
         eat(tokens);
         const value = parseTypeAnnotation(tokens);
         if (!value) err(`Expected a value type in map<...>`, peekTok(tokens));
-        if (peek(tokens) !== ">") err(`Expected '>' after a map's value type`, peekTok(tokens));
-        eat(tokens);
+        eatTypeClose(tokens, "a map's value type");
         let t = `map<${key},${value}>`;
         if (peek(tokens) === "[" && (tokens[1]?.value as string) === "]") { eat(tokens); eat(tokens); t += "[]"; }
         return t as Ltype;
@@ -437,8 +515,7 @@ function parseTypeAnnotation(tokens: Token[]): Ltype | undefined {
         if (peek(tokens) === "[" && tokens[1]?.value === "]") { eat(tokens); eat(tokens); t += "[]"; }
         return t as Ltype;
     }
-    if (next === "int" || next === "string" || next === "bool" || next === "float" ||
-        next === "char" || next === "void" || next === "unknown") {
+    if (BASIC_TYPES.includes(next)) {
         eat(tokens);
         if (peek(tokens) === "[") {
             eat(tokens);
@@ -563,18 +640,18 @@ function parseTokens(tokens: Token[]): Node {
             return assignTo(target, value, exprTokens[0]);
         }
 
-        const compIdx = exprTokens.findIndex((t, i) => ["+=", "-=", "*=", "/=", "%="].includes(t.value) && topLevel(i));
+        const compIdx = exprTokens.findIndex((t, i) => COMPOUND_OPS.includes(t.value) && topLevel(i));
         if (compIdx > 1) {
             // a[i] += v and p.f += v become a[i] = a[i] + v (the target is parsed twice)
             const op = exprTokens[compIdx].value;
             const target = parseExpression(exprTokens.slice(0, compIdx));
             const current = parseExpression(exprTokens.slice(0, compIdx));
             const rhs = parseExpression(exprTokens.slice(compIdx + 1));
-            const value: Node = { type: "Binary", value: op[0], children: [current, rhs], line: exprTokens[0].line, col: exprTokens[0].col };
+            const value: Node = { type: "Binary", value: op.slice(0, -1), children: [current, rhs], line: exprTokens[0].line, col: exprTokens[0].col, compound: true };
             return assignTo(target, value, exprTokens[0]);
         }
 
-        const compOpIdx = exprTokens.findIndex(t => ["+=", "-=", "*=", "/=", "%="].includes(t.value));
+        const compOpIdx = exprTokens.findIndex(t => COMPOUND_OPS.includes(t.value));
         if (compOpIdx === 1) {
             const name = exprTokens[0].value;
             const op = exprTokens[compOpIdx].value;
@@ -669,21 +746,11 @@ function parseTokens(tokens: Token[]): Node {
         let init: Node | null = null;
         if (initTokens.length) {
             if (initTokens[0].value === "var" || initTokens[0].value === "let" || initTokens[0].value === "const") {
-                let offset = 1;
-                const typeTok = initTokens[offset];
-                let varType: Ltype | undefined;
-                if (["int","string","bool","float","char","void","unknown"].includes(typeTok?.value)) {
-                    const typeName = initTokens[offset++].value;
-                    if (initTokens[offset]?.value === "[") {
-                        offset += 2;
-                        varType = (typeName + "[]") as Ltype;
-                    } else {
-                        varType = typeName as Ltype;
-                    }
-                }
-                const name = initTokens[offset++].value;
-                offset++;
-                const exprTokens = initTokens.slice(offset);
+                const rest = initTokens.slice(1);
+                const varType = parseTypeAnnotation(rest);
+                const name = rest.shift()!.value;
+                rest.shift();   // =
+                const exprTokens = rest;
                 init = { type: "VarDecl", value: name, varType, isConst: initTokens[0].value === "const", children: [parseExpression(exprTokens)] };
             } else {
                 init = parseExpression(initTokens);
@@ -783,29 +850,7 @@ function parseTokens(tokens: Token[]): Node {
         const name = eat(tokens);
         eat(tokens);
 
-        const params: Node[] = [];
-        while (peek(tokens) !== ")") {
-            // tuple, function and map types: (int, string) t, fn(int): int f, map<string, int> m
-            if (peek(tokens) === "(" || (peek(tokens) === "fn" && tokens[1]?.value === "(") ||
-                (peek(tokens) === "map" && tokens[1]?.value === "<")) {
-                const paramType = parseTypeAnnotation(tokens)!;
-                params.push({ type: "Identifier", value: eat(tokens)!, varType: paramType, children: [] });
-                continue;
-            }
-            const p = eat(tokens)!;
-            if (p === ",") continue;
-            if (["int","string","bool","float","char","void","unknown"].includes(p) || /^[A-Z]/.test(p)) {
-                let paramType: Ltype = p as Ltype;
-                if (peek(tokens) === "[") {
-                    eat(tokens); eat(tokens);
-                    paramType = (p + "[]") as Ltype;
-                    if (peek(tokens) === "[") { eat(tokens); eat(tokens); paramType = (p + "[][]") as Ltype; }
-                }
-                params.push({ type: "Identifier", value: eat(tokens), varType: paramType, children: [] });
-                continue;
-            }
-            params.push({ type: "Identifier", value: p, children: [] });
-        }
+        const params = parseFunctionParams();
         eat(tokens);
         const returnType = parseReturnType();
         eat(tokens);
@@ -853,37 +898,52 @@ function parseTokens(tokens: Token[]): Node {
         return body;
     }
 
+    // a parameter list up to (not including) its ')': typed (int x, ptr<u8> p, map<string, int> m,
+    // (int, string) t, fn(int): int f, P[] ps), untyped (x), or variadic (...xs)
     function parseFunctionParams(): Node[] {
         const params: Node[] = [];
         while (peek(tokens) !== ")") {
-            // tuple, function and map types: (int, string) t, fn(int): int f, map<string, int> m
-            if (peek(tokens) === "(" || (peek(tokens) === "fn" && tokens[1]?.value === "(") ||
-                (peek(tokens) === "map" && tokens[1]?.value === "<")) {
-                const paramType = parseTypeAnnotation(tokens)!;
-                params.push({ type: "Identifier", value: eat(tokens)!, varType: paramType, children: [] });
-                continue;
-            }
-            const p = eat(tokens)!;
-            if (p === ",") continue;
-            if (p === "...") {
+            if (peek(tokens) === ",") { eat(tokens); continue; }
+            if (peek(tokens) === "...") {
+                eat(tokens);
                 const vname = eat(tokens)!;
-                params.push({ type: "Identifier", value: vname, varType: "int[]" as Ltype, children: [], isConst: false });
-                params[params.length - 1].value = "..." + vname;
+                params.push({ type: "Identifier", value: "..." + vname, varType: "int[]" as Ltype, children: [], isConst: false });
                 continue;
             }
-            if (["int","string","bool","float","char","void","unknown"].includes(p) || /^[A-Z]/.test(p)) {
-                let paramType: Ltype = p as Ltype;
-                if (peek(tokens) === "[") {
-                    eat(tokens); eat(tokens);
-                    paramType = (p + "[]") as Ltype;
-                    if (peek(tokens) === "[") { eat(tokens); eat(tokens); paramType = (p + "[][]") as Ltype; }
-                }
-                params.push({ type: "Identifier", value: eat(tokens)!, varType: paramType, children: [] });
+            const paramType = parseTypeAnnotation(tokens);
+            if (paramType) {
+                // int[][] (parseTypeAnnotation reads one [])
+                let t: string = paramType;
+                if (t.endsWith("[]") && peek(tokens) === "[" && tokens[1]?.value === "]") { eat(tokens); eat(tokens); t += "[]"; }
+                params.push({ type: "Identifier", value: eat(tokens)!, varType: t as Ltype, children: [] });
                 continue;
             }
-            params.push({ type: "Identifier", value: p, children: [] });
+            params.push({ type: "Identifier", value: eat(tokens)!, children: [] });
         }
         return params;
+    }
+
+    // packed struct S { var f: u16; ... }: fields only, laid out in order with no padding
+    function parsePackedStruct(at: Token): Node {
+        const name = eat(tokens);
+        if (peek(tokens) !== "{") err(`Expected '{' after packed struct ${name}`, peekTok(tokens));
+        eat(tokens);
+        const fields: Node[] = [];
+        while (peek(tokens) !== "}") {
+            const ftok = peekTok(tokens);
+            const kw = eat(tokens);
+            if (kw !== "var") err(`A packed struct only has fields: expected 'var name: type;', got '${kw}'`, ftok);
+            const fieldName = eat(tokens);
+            if (peek(tokens) !== ":") err(`Expected ':' after the field name ${fieldName}`, peekTok(tokens));
+            eat(tokens);
+            const fieldType = parseTypeAnnotation(tokens);
+            if (!fieldType) err(`Expected a type for field ${fieldName}`, peekTok(tokens));
+            if (peek(tokens) !== ";") err(`Expected ';' after field ${fieldName} (packed struct fields can't have defaults)`, peekTok(tokens));
+            eat(tokens);
+            fields.push({ type: "StructField", value: fieldName, varType: fieldType, children: [], line: ftok?.line, col: ftok?.col });
+        }
+        eat(tokens);
+        return { type: "PackedStructDef", value: name, children: fields, line: at.line, col: at.col };
     }
 
     while (tokens.length) {
@@ -891,7 +951,10 @@ function parseTokens(tokens: Token[]): Node {
         if (!tok) break;
         const t = tok.value;
 
-        if (t === "function" || t === "fn") {
+        // interrupt fn name(ptr<InterruptFrame> frame[, u64 error_code]) { ... }
+        const isInterrupt = t === "interrupt" && (peek(tokens) === "fn" || peek(tokens) === "function");
+        if (isInterrupt) eat(tokens);
+        if (t === "function" || t === "fn" || isInterrupt) {
             const name = eat(tokens);
             eat(tokens);
             const params = parseFunctionParams();
@@ -900,12 +963,34 @@ function parseTokens(tokens: Token[]): Node {
             eat(tokens);
             const body = parseBlockBody();
             eat(tokens);
-            program.children.push({ type: "Function", value: name, varType: returnType, children: [...params, body], line: tok.line, col: tok.col });
+            program.children.push({ type: "Function", value: name, varType: returnType, children: [...params, body], line: tok.line, col: tok.col,
+                                    ...(isInterrupt ? { interrupt: true } : {}) });
             continue;
         }
 
         if (t === "struct") {
             program.children.push(parseStruct());
+            continue;
+        }
+
+        if (t === "packed" && peek(tokens) === "struct") {
+            eat(tokens);
+            program.children.push(parsePackedStruct(tok));
+            continue;
+        }
+
+        // extern fn name(u64 a, u16 b): u32;  a function defined in assembly or C
+        if (t === "extern" && (peek(tokens) === "fn" || peek(tokens) === "function")) {
+            eat(tokens);
+            const name = eat(tokens);
+            if (peek(tokens) !== "(") err(`Expected '(' after extern fn ${name}`, peekTok(tokens));
+            eat(tokens);
+            const params = parseFunctionParams();
+            eat(tokens);
+            const returnType = parseReturnType();
+            if (peek(tokens) !== ";") err(`Expected ';' after extern fn ${name}(...): an extern function has no body`, peekTok(tokens));
+            eat(tokens);
+            program.children.push({ type: "ExternFn", value: name, varType: returnType, children: params, line: tok.line, col: tok.col });
             continue;
         }
 
@@ -932,4 +1017,4 @@ function parseTokens(tokens: Token[]): Node {
     return program;
 }
 
-module.exports = { parse, parseWithPos };
+module.exports = { parse, parseWithPos, SIZED_INTS };

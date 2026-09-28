@@ -104,3 +104,60 @@ export function mapTypeParts(t: string | undefined): { key: string, value: strin
     const [key, value] = tupleTypeParts(`(${t.slice(4, -1)})`);
     return { key, value };
 }
+
+// ── Low-level types: sized integers, pointers and packed structs ──
+
+import { SIZED_INTS } from "./Parser";
+
+export const isSizedInt = (t: string | undefined): boolean => !!t && t in SIZED_INTS;
+// narrower than 64 bits: a value of this type is kept widened, and stores/casts cut it to size
+export const isSmallInt = (t: string | undefined): boolean => isSizedInt(t) && SIZED_INTS[t!].size < 8;
+export const isPtrType = (t: string | undefined): boolean => !!t && t.startsWith("ptr<") && t.endsWith(">");
+export const ptrElem = (t: string | undefined): string | undefined => isPtrType(t) ? t!.slice(4, -1) : undefined;
+
+// packed struct S { var f: u16; ... }: fields in order, no padding and no hidden header
+export type PackedField = { name: string, type: string, offset: number };
+export type PackedDef = { size: number, fields: PackedField[] };
+const packedFields = new Map<string, { name: string, type: string }[]>();
+const packedLayouts = new Map<string, PackedDef>();
+
+export function registerPacked(name: string, fields: { name: string, type: string }[]) {
+    packedFields.set(name, fields);
+}
+
+export function isPackedStruct(name: string | undefined): boolean {
+    return !!name && packedFields.has(name);
+}
+
+// the layout of a packed struct (a nested packed struct is laid out inline)
+export function packedLayout(name: string, inProgress = new Set<string>()): PackedDef {
+    const done = packedLayouts.get(name);
+    if (done) return done;
+    const raw = packedFields.get(name);
+    if (!raw) throw new Error(`Unknown packed struct: ${name}`);
+    if (inProgress.has(name)) throw new Error(`packed struct ${name} contains itself`);
+    inProgress.add(name);
+    const fields: PackedField[] = [];
+    let offset = 0;
+    for (const f of raw) {
+        const size = sizeOfType(f.type, inProgress);
+        if (size === undefined) {
+            throw new Error(`Field ${f.name} of packed struct ${name} can't be ${f.type}: packed struct fields are sized integers, int, char, bool, pointers or other packed structs`);
+        }
+        fields.push({ name: f.name, type: f.type, offset });
+        offset += size;
+    }
+    inProgress.delete(name);
+    const def = { size: offset, fields };
+    packedLayouts.set(name, def);
+    return def;
+}
+
+// the size in bytes of a type that can live in raw memory, or undefined (strings, arrays, floats, ...)
+export function sizeOfType(t: string, inProgress = new Set<string>()): number | undefined {
+    if (isSizedInt(t)) return SIZED_INTS[t].size;
+    if (t === "int" || isPtrType(t)) return 8;
+    if (t === "char" || t === "bool") return 1;
+    if (isPackedStruct(t)) return packedLayout(t, inProgress).size;
+    return undefined;
+}

@@ -21,11 +21,15 @@ const checkOnly = process.argv.includes("--check");
 // --nolibc: link against runtime/nolibc.c (our own malloc, printf, syscalls, _start) instead of the C
 // library, so the program depends on nothing but the kernel; the graphics module isn't available
 const noLibc = process.argv.includes("--nolibc");
+// --kernel: the program is an operating system kernel. Its entry point is kernel_main (called by your
+// boot code), and it compiles to <output>.o plus <output>-runtime.o (nolibc.c built with -DL_KERNEL,
+// and lrt.c) for you to link with your boot code and linker script
+const kernelMode = process.argv.includes("--kernel");
 
 const [inputFile, outputFile = "output"] = process.argv.slice(2).filter((a: string) => !a.startsWith("--"));
 
 if (!inputFile) {
-    console.error("Usage: node Main.js <source-file> [output-file] [--check] [--nolibc] [--ir] [--ast] [--asm] [--tokens] [--verbose]");
+    console.error("Usage: node Main.js <source-file> [output-file] [--check] [--nolibc] [--kernel] [--ir] [--ast] [--asm] [--tokens] [--verbose]");
     process.exit(1);
 }
 
@@ -150,6 +154,13 @@ define(globalScope, { name: "print_string",    kind: "func", params: 1 });
 define(globalScope, { name: "print_int",       kind: "func", params: 1 });
 define(globalScope, { name: "ord",             kind: "func", params: 1 });
 define(globalScope, { name: "chr",             kind: "func", params: 1 });
+// port I/O (single in/out instructions)
+define(globalScope, { name: "inb",             kind: "func", params: 1, type: "u8" });
+define(globalScope, { name: "inw",             kind: "func", params: 1, type: "u16" });
+define(globalScope, { name: "inl",             kind: "func", params: 1, type: "u32" });
+define(globalScope, { name: "outb",            kind: "func", params: 2 });
+define(globalScope, { name: "outw",            kind: "func", params: 2 });
+define(globalScope, { name: "outl",            kind: "func", params: 2 });
 // C runtime graphics functions (graphics.o)
 define(globalScope, { name: "gfx_window_init",    kind: "func", params: 3 });
 define(globalScope, { name: "gfx_should_close",   kind: "func", params: 0 });
@@ -181,6 +192,14 @@ try {
 if (errors.length) {
     for (const msg of errors) console.error(`Error: ${locate(msg)}`);
     process.exit(1);
+}
+
+if (kernelMode) {
+    // a kernel starts at kernel_main (your boot code calls it); main is for programs
+    const fns = optimizedAst.children.filter(c => c.type === "Function");
+    const mainFn = fns.find(f => f.value === "main");
+    if (mainFn) die(`${mainFn.line}:${mainFn.col}: --kernel: a kernel's entry point is kernel_main, not main`);
+    if (!fns.some(f => f.value === "kernel_main")) die("--kernel: a kernel needs a kernel_main function (your boot code calls it)");
 }
 
 let IR: ReturnType<typeof IRGen>;
@@ -238,7 +257,7 @@ if (verbose) {
 
 let nasm: string;
 try {
-    nasm = emitNASM(freedIR);
+    nasm = emitNASM(freedIR, { kernel: kernelMode });
 } catch (e: any) {
     die(e.message);
 }
@@ -270,9 +289,33 @@ function buildRuntime(name: string, object: string, flags: string): string {
     return o;
 }
 
+// a call into graphics.c (which needs GLFW and OpenGL, and so the C library)
+const graphicsCall = /^\s*call\s+\$?(gfx_c_\w+|gfx_window_init|gfx_should_close|gfx_swap|gfx_destroy|gfx_key_down|gfx_time|gfx_log)\s*$/m;
+
+if (kernelMode) {
+    if (graphicsCall.test(nasm)) die("The graphics module needs the C library, so it can't be used in a kernel");
+    // kernel code: no red zone (an interrupt would overwrite the space below rsp), any load address
+    // (the large code model, so a higher-half kernel works), no unwind tables
+    const flags = "-ffreestanding -fno-builtin -fno-stack-protector -fno-pie -mno-red-zone -mcmodel=large -fno-asynchronous-unwind-tables -DL_KERNEL";
+    const lrtO = buildRuntime("lrt", "lrt-kernel", flags);
+    const kernelRtO = buildRuntime("nolibc", "nolibc-kernel", flags);
+    try {
+        // one relocatable object with the runtime (and the few libgcc helpers gcc may call)
+        const libgcc = chldproc.execSync("gcc -print-libgcc-file-name").toString().trim();
+        chldproc.execSync(`ld -r ${lrtO} ${kernelRtO} ${libgcc} -o ${outputFile}-runtime.o`, { stdio: "pipe" });
+    } catch (e: any) {
+        die(`Could not build the kernel runtime:\n${e.stderr?.toString() ?? e.message}`);
+    }
+    if (asm) {
+        console.error("=== NASM ===");
+        console.error(nasm);
+    }
+    console.log(`Compiled kernel to ${outputFile}.o`);
+    console.log(`Link it with ${outputFile}-runtime.o, your boot code and your linker script`);
+    process.exit(0);
+}
+
 if (noLibc) {
-    // a call into graphics.c (which needs GLFW and OpenGL, and so the C library)
-    const graphicsCall = /^\s*call\s+\$?(gfx_c_\w+|gfx_window_init|gfx_should_close|gfx_swap|gfx_destroy|gfx_key_down|gfx_time|gfx_log)\s*$/m;
     if (graphicsCall.test(nasm)) die("The graphics module needs the C library, so it can't be used with --nolibc");
     // No C library means no stack-protector canary (it's read through the fs register, which libc sets
     // up) and no builtins: gcc must not turn nolibc.c's own memset loop into a call to memset

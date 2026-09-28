@@ -355,6 +355,20 @@ module.exports = {
         fixed: "Optimize.ts insertFrees: a mov from one named variable into another local is a borrow (srcDepth undefined), so the source keeps owning; " +
                "only a temp's value, or a move into a global, transfers ownership.",
     },
+    B61: {
+        title: "A pointer holding a literal address read and wrote the wrong memory",
+        cause: "Emitter.ts mem_load / mem_store loaded the address with memRef(), which only knows variable names. copyProp replaces a pointer given a " +
+               "literal address (var ptr<u16> vga = 0xB8000;) by the literal, so the address was taken from an uninitialised stack slot named after the number. " +
+               "Found by the page-fault test in KernelTests.js (the write to an unmapped address didn't fault).",
+        fixed: "Emitter.ts mem_load / mem_store load the address with loadOperand(), which handles literals (of any size) and globals.",
+    },
+    B62: {
+        title: "Globals were set up in source order, so a number global could still be 0 when used",
+        cause: "Every global lived in .bss and was given its value by code at the start of main (kernel_main). A global set up earlier that used a later one " +
+               "saw 0: in a kernel, a heap global declared before the allocator's `var u64 next_page = 0x400000;` made kernel_alloc_pages hand out memory at address 0 " +
+               "(over VGA memory). Found by the timer example.",
+        fixed: "Emitter.ts: a global given a plain number (and not set again before main) is stored in .data with that value, so it holds it from the start.",
+    },
 
     S1: {
         title: "math_sqrt is inaccurate for large and tiny inputs",

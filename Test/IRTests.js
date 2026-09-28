@@ -15,7 +15,7 @@ const verbose = process.argv.includes("--verbose");
 const main = body => `main() {\n${body}\n    return 0;\n}\n`;
 
 // each test: a program, lines (RegExp or text) the "Freed IR" section (or `section`) must contain,
-// and lines it must not
+// and lines it must not; `flags` are extra compiler flags (--asm for the "NASM" section)
 const tests = [
     { name: "str_concat is printed",
       source: main(`var string a = "x";\n var string s = a + "y";\n print(s);`),
@@ -39,6 +39,35 @@ const tests = [
       source: `struct P {\n    var n: int;\n    fn f() { return this.n; }\n}\n` +
               main(`var P[] ps = [P { n: 1 }];\n var float[] f = [1.5];\n var string[] w = ["x"];\n print(ps[0].f());\n print(f[0] * 2.0);\n print(w[0] + "y");\n print(w[0] < "z");\n print(-f[0]);`),
       absent: [/^\s*\{"op"/m] },
+
+    // ── Low level: sized integers, pointers, ports ──
+
+    { name: "sized ops, pointer loads and stores are printed", flags: ["--check"],   // --check: get() is never linked
+      source: `extern fn get(): ptr<u16>;\n` + main(`var ptr<u16> p = get();\n p[3] = 0x0F41;\n var u8 b = u8(p[1]);\n b += 1;\n var u64 h = 5;\n print(h / 2);\n print(~b);\n print(-8 >> 1);`),
+      contains: [/; extern get/, /mem_store 16-bit \[\S+\] = \S+/, /mem_load\s+t\d+ = u16 \[\S+\]/, /trunc\s+t\d+ = u8\(\S+\)/,
+                 /div\s+t\d+ = \S+ div unsigned \S+/, /bnot\s+t\d+ = ~\S+/, /sar\s+t\d+ = \S+ sar \S+/],
+      absent: [/^\s*\{"op"/m] },
+    { name: "addr() of a global is printed",
+      source: `var int G = 1;\n` + main(`var u64 a = addr(G);\n print(a != 0);`),
+      contains: [/global_addr t\d+ = &G/] },
+    { name: "port I/O compiles to in and out", section: "NASM", flags: ["--asm"],
+      source: main(`outb(0x20, 0x20);\n var u8 sc = inb(0x60);\n outw(0x1F0, u16(sc));\n outl(0xCF8, inl(0xCFC));\n print(sc);`),
+      contains: ["out dx, al", "in al, dx", "out dx, ax", "in eax, dx", "out dx, eax"] },
+    { name: "pointer reads and writes use the element size", section: "NASM", flags: ["--asm"],
+      source: `function get(): ptr<u8> { return ptr<u8>(0x1000); }\n` + main(`var ptr<u8> m = get();\n var ptr<i16> s = ptr<i16>(m);\n var ptr<u32> d = ptr<u32>(m);\n m[0] = 1;\n s[1] = -2;\n d[1] = 7;\n print(m[2] + s[3] + d[4]);`),
+      contains: ["mov byte [rax], cl", "mov word [rax], cx", "mov dword [rax], ecx", "movzx eax, byte [rax]", "movsx rax, word [rax]", "mov eax, dword [rax]"] },
+    { name: "an interrupt fn gets a stub that saves everything and returns with iretq", section: "NASM", flags: ["--asm"],
+      source: `interrupt fn on_fault(ptr<InterruptFrame> frame, u64 error_code) {\n    print(error_code);\n    return 0;\n}\n` + main(`print(addr(on_fault) != 0);`),
+      contains: ["$on_fault:", "push r15", "fxsave64 [rsp]", "lea rdi, [rbx + 128]", "mov rsi, [rbx + 120]", "call $__isr_on_fault", "fxrstor64 [rsp]", "add rsp, 8", "iretq"] },
+    { name: "an interrupt fn's stub is printed in --ir", flags: ["--check"],
+      source: `interrupt fn on_tick(ptr<InterruptFrame> frame) {\n    return 0;\n}\n` + main(`print(1);`),
+      contains: ["; interrupt stub on_tick -> __isr_on_tick"] },
+    { name: "a global set to a number is stored with its value (B62)", section: "NASM", flags: ["--asm"],
+      source: `var u64 NEXT = 0x400000;\nvar int NEG = -5;\nvar int LATER = NEXT * 2;\n` + main(`print(NEXT + NEG + LATER);`),
+      contains: ["__g_NEXT: dq 4194304", "__g_NEG: dq -5", "__g_LATER: resq 1"] },
+    { name: "u64 comparisons are unsigned", section: "NASM", flags: ["--asm"],
+      source: main(`var u64 a = 1;\n var u64 b = 2;\n print(a < b);\n print(a >= b);`),
+      contains: ["setb al", "setae al"] },
 
     // ── Optimizer passes (checked in the "Optimized IR" section; plain strings match anywhere) ──
 
@@ -133,7 +162,7 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lir-"));
 for (const t of tests) {
     const src = path.join(dir, "t.l");
     fs.writeFileSync(src, t.source);
-    const r = spawnSync("node", [COMPILER, src, path.join(dir, "t"), "--ir"], { encoding: "utf8" });
+    const r = spawnSync("node", [COMPILER, src, path.join(dir, "t"), "--ir", ...(t.flags ?? [])], { encoding: "utf8" });
     const out = r.stderr + r.stdout;
     const section = t.section ?? "Freed IR";
     const start = out.indexOf(`=== ${section} ===`);

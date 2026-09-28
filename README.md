@@ -24,6 +24,7 @@ main() {
 - Strings with escape sequences, ordering, substrings, search/case helpers, and split/join/trim/replace; `const` variables
 - For-in loops, match expressions, short-circuit `&&`/`||`
 - Inline assembly via `asm { }`
+- Low-level programming for OS kernels: sized integers (`u8`...`u64`, `i8`...`i32`), bitwise operators, pointers (`ptr<u16>`), packed structs with exact layouts, port I/O (`inb`/`outb`), `extern fn` to call assembly and C, `interrupt fn` handlers, and a `--kernel` mode to build an OS kernel
 - Standard library (`math`, trig, strings, graphics)
 - VS Code extension with syntax highlighting and a language server that shows compiler errors on save
 
@@ -33,6 +34,7 @@ main() {
 - NASM
 - GCC (used to link, and to build the runtime `Typescript/runtime/lrt.c` the first time a program is compiled)
 - GLFW and OpenGL development libraries (linked for the `graphics` module)
+- For kernels (optional): QEMU to boot them, and GRUB (`grub-mkrescue`, `xorriso`) to make an ISO
 - Linux x86-64
 
 ## Building
@@ -62,6 +64,7 @@ node dist/Main.js hello.l hello     # compiles to ./hello
 | `--verbose` | Print all of the above                |
 | `--check`   | Only check for errors; write no files |
 | `--nolibc`  | Link against L's own runtime instead of the C library |
+| `--kernel`  | Compile an OS kernel to `<output>.o` and `<output>-runtime.o` (see LANGUAGE.md, Writing a Kernel) |
 
 ## Tests
 
@@ -71,6 +74,7 @@ node Test/StdlibTests.js                # standard library suite
 node Test/RegressionTests.js            # older whole-program tests (from the original Runner.js)
 node Test/IRTests.js                    # --ir output and optimizer passes
 node Test/ServerTests.js                # --check and the language server's diagnostics
+node Test/KernelTests.js                # --kernel: boots small kernels in QEMU
 node Test/LanguageTests.js --memcheck --leaks   # also run every test under AddressSanitizer
 node Test/LanguageTests.js --nolibc             # compile every test with --nolibc (runtime/nolibc.c instead of libc)
 ```

@@ -4,8 +4,22 @@ import { IR, isHeapT } from "./IR";
 export function fold(node: Node): Node {
     switch (node.type) {
         case "Binary": {
-            const left = fold(node.children[0]);
-            const right = fold(node.children[1]);
+            // a char literal in arithmetic is its code: 0x0F00 + 'A' folds to one number
+            const asNumber = (n: Node): Node => n.type === "Char" && !["==", "!=", "<", ">", "<=", ">="].includes(node.value!)
+                ? { type: "Number", value: String(n.value!.charCodeAt(0)), children: [], line: n.line, col: n.col } : n;
+            const left = asNumber(fold(node.children[0]));
+            const right = asNumber(fold(node.children[1]));
+
+            // bitwise operators on two ints, as 64-bit values (>> only when the value is positive,
+            // where signed and unsigned shifts agree)
+            if (left.type === "Number" && right.type === "Number" && /^-?\d+$/.test(left.value!) && /^-?\d+$/.test(right.value!) &&
+                left.varType !== "float" && right.varType !== "float" && ["&", "|", "^", "<<", ">>"].includes(node.value!)) {
+                const a = BigInt.asIntN(64, BigInt(left.value!)), b = BigInt(right.value!);
+                const shiftOk = b >= 0n && b < 64n;
+                const n = node.value === "&" ? a & b : node.value === "|" ? a | b : node.value === "^" ? a ^ b
+                    : node.value === "<<" && shiftOk ? a << b : node.value === ">>" && shiftOk && a >= 0n ? a >> b : undefined;
+                if (n !== undefined) return { type: "Number", value: BigInt.asIntN(64, n).toString(), children: [], line: node.line, col: node.col };
+            }
 
             if (left.type === "Number" && right.type === "Number") {
                 const l = parseFloat(left.value! as string);
@@ -61,6 +75,11 @@ export function fold(node: Node): Node {
                 switch (node.value) {
                     case "+":
                         return operand;
+                    case "~":
+                        if (operand.varType !== "float" && /^-?\d+$/.test(operand.value!)) {
+                            return { type: "Number", value: BigInt.asIntN(64, ~BigInt(operand.value!)).toString(), children: [], line: node.line, col: node.col };
+                        }
+                        break;
                     case "-":
                         // an int negates as a 64-bit value (parseFloat would round it above 2^53)
                         if (operand.varType !== "float" && /^-?\d+$/.test(operand.value!)) {
@@ -639,7 +658,7 @@ export function cse(instructions: IR[]): IR[] {
             instr.op === "lt"  || instr.op === "lte" ||
             instr.op === "gt"  || instr.op === "gte"
         ) {
-            const k = key(instr.op, instr.a, instr.b);
+            const k = key(instr.op + ((instr as any).unsigned ? "_u" : ""), instr.a, instr.b);
             if (exprMap.has(k)) {
                 out.push({ op: "mov", dst: instr.dst, src: exprMap.get(k)! });
                 continue;

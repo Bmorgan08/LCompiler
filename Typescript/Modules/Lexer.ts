@@ -84,6 +84,15 @@ export function LexerWithPos(src: string): Token[] {
                 tokens.push({ value: num, line: startLine, col: startCol });
                 col += num.length;
             }
+        } else if ((c === "<" || c === ">") && src[i + 1] === c) {
+            // << and >> (and <<= / >>=). A type like map<string, map<string, int>> ends in >>, which
+            // parseTypeAnnotation splits back into two >
+            const op = src[i + 2] === "=" ? c + c + "=" : c + c;
+            tokens.push({ value: op, line: startLine, col: startCol });
+            i += op.length - 1; col += op.length;
+        } else if ((c === "&" || c === "|" || c === "^") && src[i + 1] === "=") {
+            tokens.push({ value: c + "=", line: startLine, col: startCol });
+            i++; col += 2;
         } else if ((c === "&" && src[i + 1] === "&") || (c === "|" && src[i + 1] === "|")) {
             tokens.push({ value: c + src[i + 1], line: startLine, col: startCol });
             i++; col += 2;

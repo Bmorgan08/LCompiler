@@ -57,7 +57,7 @@
         },
         {
           "name": "keyword.declaration.l",
-          "match": "\\b(var|let|function|fn|struct|extends|overrides|new|const|import|asm|main)\\b"
+          "match": "\\b(var|let|function|fn|struct|packed|extern|interrupt|extends|overrides|new|const|import|asm|main)\\b"
         },
         {
           "name": "variable.language.l",
@@ -67,11 +67,11 @@
     },
     "types": {
       "name": "storage.type.l",
-      "match": "\\b(int|bool|string|float|char|void|map)\\b"
+      "match": "\\b(int|bool|string|float|char|void|map|ptr|u8|u16|u32|u64|i8|i16|i32)\\b"
     },
     "builtins": {
       "name": "support.function.builtin.l",
-      "match": "\\b(print|printchar|input|inputstr|len|strtoint|inttostr|chartostr|floattostr|str_find|str_contains|str_upper|str_lower|str_split|str_join|str_trim|str_replace|strtofloat|str_is_space|ord|chr|print_string|print_int)\\b(?=\\s*\\()"
+      "match": "\\b(print|printchar|input|inputstr|len|strtoint|inttostr|chartostr|floattostr|str_find|str_contains|str_upper|str_lower|str_split|str_join|str_trim|str_replace|strtofloat|str_is_space|ord|chr|print_string|print_int|inb|inw|inl|outb|outw|outl|addr|sizeof)\\b(?=\\s*\\()"
     },
     "struct-declaration": {
       "match": "\\b(struct)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(extends)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
@@ -110,12 +110,20 @@
     "operators": {
       "patterns": [
         {
+          "name": "keyword.operator.bitwise.l",
+          "match": "<<=?|>>=?"
+        },
+        {
           "name": "keyword.operator.comparison.l",
           "match": "==|!=|<=|>=|<|>"
         },
         {
           "name": "keyword.operator.logical.l",
           "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.bitwise.l",
+          "match": "[&|^~]"
         },
         {
           "name": "keyword.operator.arithmetic.l",

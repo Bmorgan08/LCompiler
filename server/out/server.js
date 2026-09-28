@@ -715,6 +715,14 @@ function makeBuiltins() {
         { name: "str_replace", kind: "func", params: 3, detail: "str_replace(s, from, to) → string — every from replaced by to" },
         { name: "strtofloat", kind: "func", params: 1, detail: "strtofloat(s) → float — parse string to float" },
         { name: "str_is_space", kind: "func", params: 1, detail: "str_is_space(c) → bool — space, tab, newline or carriage return" },
+        { name: "inb", kind: "func", params: 1, detail: "inb(port) → u8 — read a byte from an I/O port" },
+        { name: "inw", kind: "func", params: 1, detail: "inw(port) → u16 — read 16 bits from an I/O port" },
+        { name: "inl", kind: "func", params: 1, detail: "inl(port) → u32 — read 32 bits from an I/O port" },
+        { name: "outb", kind: "func", params: 2, detail: "outb(port, u8 value) — write a byte to an I/O port" },
+        { name: "outw", kind: "func", params: 2, detail: "outw(port, u16 value) — write 16 bits to an I/O port" },
+        { name: "outl", kind: "func", params: 2, detail: "outl(port, u32 value) — write 32 bits to an I/O port" },
+        { name: "addr", kind: "func", params: 1, detail: "addr(x) → u64 — the address of a function, global, or p[i] / p.field" },
+        { name: "sizeof", kind: "func", params: 1, detail: "sizeof(T) → int — the size in bytes of a type" },
         { name: "strtoint", kind: "func", params: 1, detail: "strtoint(s) → int — parse string to int" },
         { name: "inttostr", kind: "func", params: 1, detail: "inttostr(n) → string — convert int to string" },
         { name: "chartostr", kind: "func", params: 1, detail: "chartostr(c) → string — one-character string" },
@@ -1141,10 +1149,10 @@ connection.onCompletion((params) => {
         }
     });
     // Keywords
-    const keywords = ["var", "function", "fn", "struct", "return", "if", "else", "while", "for", "match", "break", "continue", "new", "extends", "overrides", "this", "const", "main", "in", "let", "import", "asm"];
+    const keywords = ["var", "function", "fn", "struct", "return", "if", "else", "while", "for", "match", "break", "continue", "new", "extends", "overrides", "this", "const", "main", "in", "let", "import", "asm", "packed", "extern", "interrupt"];
     keywords.forEach(k => items.push({ label: k, kind: node_1.CompletionItemKind.Keyword }));
     // Types
-    ["int", "bool", "float", "string", "char", "void", "map"].forEach(t => items.push({ label: t, kind: node_1.CompletionItemKind.TypeParameter }));
+    ["int", "bool", "float", "string", "char", "void", "map", "ptr", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "InterruptFrame"].forEach(t => items.push({ label: t, kind: node_1.CompletionItemKind.TypeParameter }));
     // Boolean literals
     ["true", "false", "none"].forEach(k => items.push({ label: k, kind: node_1.CompletionItemKind.Keyword }));
     return items;

@@ -8,6 +8,9 @@ const lines = (...xs) => xs.join("\n");
 // wraps statements in a main() that returns 0
 const main = body => `main() {\n${body}\n    return 0;\n}\n`;
 
+// raw memory for the pointer tests: the C library's malloc and free, declared with extern fn
+const MEM = `extern fn malloc(u64 size): ptr<u8>;\nextern fn free(ptr<u8> p);\n`;
+
 const tests = [
 
     // ── Program structure ────────────────────────────────────────────────
@@ -1477,6 +1480,216 @@ const tests = [
     { name: "regress: a local can share a function's name",
       source: `function double(int x): int { return x * 2; }\n` + main(lines("var string s = \"hello\";", "var int len = len(s);", "var int double = double(len);", "print(len);", "print(double);", "print(len(\"ab\"));")),
       expected: "5\n10\n2" },
+
+    // ── Low level: sized integers, bitwise operators, pointers, packed structs, ports, extern fn ──
+
+    // sized integers
+    { name: "sized: u8 wraps on += and ++",
+      source: main(lines("var u8 a = 250;", "a += 10;", "print(a);", "var u8 c = 255;", "c++;", "print(c);", "var u8 d = 0;", "d--;", "print(d);")),
+      expected: "4\n0\n255" },
+    { name: "sized: i8 and i16 wrap with their sign",
+      source: main(lines("var i8 s = -100;", "s -= 100;", "print(s);", "var i16 w = 32767;", "w++;", "print(w);")),
+      expected: "56\n-32768" },
+    { name: "sized: casts cut values to size",
+      source: main(lines("print(u16(70000));", "print(i32(0xFFFFFFFF));", "print(u8(-1));", "print(i8(200));", "print(u32(-1));", "print(int(u8(511)));")),
+      expected: "4464\n-1\n255\n-56\n4294967295\n255" },
+    { name: "sized: arithmetic is done at full width",
+      source: main(lines("var u8 a = 200;", "var u8 b = 100;", "var int sum = a + b;", "print(sum);", "var u8 attr = 0x0F;", "print(attr << 8);")),
+      expected: "300\n3840" },
+    { name: "sized: literals that fit are accepted",
+      source: main(lines("var u8 a = 0xFF;", "var i16 b = -32768;", "var u32 c = 0xFFFFFFFF;", "var i8 d = -128;", "var u8 e = 'A';", "print(a);", "print(b);", "print(c);", "print(d);", "print(e);")),
+      expected: "255\n-32768\n4294967295\n-128\n65" },
+    { name: "sized: smaller values widen without a cast",
+      source: main(lines("var u8 a = 200;", "var u16 b = a;", "var int c = b;", "var i16 d = a;", "var i8 e = -5;", "var i32 f = e;", "var float g = a;", "print(b + c + d);", "print(f);", "print(g);")),
+      expected: "600\n-5\n200" },
+    { name: "sized: an int into a u8 needs a cast",
+      source: main(lines("var int x = 5;", "var u8 b = x;")), shouldError: true, errorMatch: /declared u8, inferred int \(use u8\(\.\.\.\) to convert\)/ },
+    { name: "sized: a literal that doesn't fit is an error",
+      source: main(`var u8 b = 300;`), shouldError: true, errorMatch: /300 doesn't fit: a u8 holds 0 to 255/ },
+    { name: "sized: a signed value doesn't go into an unsigned one",
+      source: main(lines("var i8 e = -5;", "var u8 b = e;")), shouldError: true, errorMatch: /declared u8, inferred i8/ },
+    { name: "sized: u64 compares, divides and shifts unsigned",
+      source: main(lines("var u64 huge = 0xFFFFFFFFFFFFFFFF;", "print(huge > 5);", "print(huge / 2 > 0);", "print(huge % 10);", "print(huge >> 60);", "var u64 small = 3;", "print(small < huge);")),
+      expected: "1\n1\n5\n15\n1" },
+    { name: "sized: parameters and return types",
+      source: `function add8(u8 a, u8 b): u8 { return u8(a + b); }\nfunction widen(i8 x): int { return x; }\n` +
+              main(lines("print(add8(200, 100));", "print(widen(-3));", "var u8 r = add8(1, 2);", "print(r);")),
+      expected: "44\n-3\n3" },
+    { name: "sized: for loop counter, match, array and struct field",
+      source: `struct Cell {\n    var ch: u8;\n    var attr: u8;\n}\n` +
+              main(lines("var total = 0;", "for (var u8 i = 250; i != 4; i++) { total += 1; }", "print(total);",
+                         "var u8 k = 2;", "match (k) {", "    2 => { print(20); }", "    _ => { print(0); }", "}",
+                         "var u8[] bytes = [1, 2, 255];", "print(bytes[2]);",
+                         "var c = Cell { ch: 'A', attr: 0x0F };", "c.attr += 0xF1;", "print(c.ch);", "print(c.attr);")),
+      expected: "10\n20\n255\n65\n0", memcheck: true, leaks: true },
+
+    // bitwise operators
+    { name: "bitwise: & | ^ ~ on ints",
+      source: main(lines("print(12 & 10);", "print(12 | 10);", "print(12 ^ 10);", "print(~0);", "var a = 0xF0;", "print(a & 0x3C);", "print(~a & 0xFF);")),
+      expected: "8\n14\n6\n-1\n48\n15" },
+    { name: "bitwise: shifts; >> keeps the sign of an int",
+      source: main(lines("var one = 1;", "print(one << 40);", "var neg = -8;", "print(neg >> 1);", "var x = 256;", "print(x >> 4);")),
+      expected: "1099511627776\n-4\n16" },
+    { name: "bitwise: C precedence",
+      source: main(lines("var a = 1;", "var b = 2;", "print(a + b << 3);", "print(a | b & 0);", "print(a ^ b == 3);", "print((a ^ b) == 3);", "print(1 < 2 == 1);")),
+      expected: "24\n1\n1\n1\n1" },
+    { name: "bitwise: compound assignment",
+      source: main(lines("var f = 0;", "f |= 0x80;", "f |= 1;", "f &= 0x81;", "f ^= 0x01;", "print(f);", "f <<= 2;", "print(f);", "f >>= 3;", "print(f);")),
+      expected: "128\n512\n64" },
+    { name: "bitwise: constants fold",
+      source: main(lines("print((1 << 3) | 1);", "print(0x0F00 + 'A');", "print(~0x0F & 0xFF);")),
+      expected: "9\n3905\n240" },
+    { name: "bitwise: floats are an error",
+      source: main(`print(1.5 & 3);`), shouldError: true, errorMatch: /'&' needs whole numbers, not float/ },
+
+    // pointers (memory from malloc through extern fn)
+    { name: "ptr: read and write each size",
+      source: MEM + main(lines("var ptr<u8> m = malloc(32);", "var ptr<u16> w = ptr<u16>(m);", "w[0] = 0x1234;", "print(m[0]);", "print(m[1]);",
+                               "var ptr<u32> d = ptr<u32>(m + 4);", "d[0] = 0xDEADBEEF;", "print(d[0]);", "var ptr<u64> q = ptr<u64>(m + 8);",
+                               "q[1] = 0xFFFFFFFFFFFFFFFF;", "print(q[1] > 1);", "free(m);")),
+      expected: "52\n18\n3735928559\n1", memcheck: true, leaks: true },
+    { name: "ptr: signed types are sign-extended",
+      source: MEM + main(lines("var ptr<u8> m = malloc(8);", "m[0] = 200;", "var ptr<i8> s = ptr<i8>(m);", "print(s[0]);",
+                               "var ptr<i16> s16 = ptr<i16>(m);", "s16[1] = -2;", "print(s16[1]);", "var ptr<u16> u16s = ptr<u16>(m);", "print(u16s[1]);", "free(m);")),
+      expected: "-56\n-2\n65534", memcheck: true, leaks: true },
+    { name: "ptr: p + n and p++ move by whole elements",
+      source: MEM + main(lines("var ptr<u8> m = malloc(32);", "var ptr<u64> q = ptr<u64>(m);", "q[0] = 10;", "q[1] = 20;", "q[2] = 30;",
+                               "var ptr<u64> r = q + 1;", "print(r[0]);", "r++;", "print(r[0]);", "r -= 2;", "print(r[0]);",
+                               "print(u64(q + 3) - u64(q));", "free(m);")),
+      expected: "20\n30\n10\n24", memcheck: true, leaks: true },
+    { name: "ptr: comparisons and a literal address",
+      source: MEM + main(lines("var ptr<u8> m = malloc(4);", "var ptr<u8> end = m + 4;", "print(end > m);", "print(m == m + 0);",
+                               "var ptr<u8> nothing = 0;", "print(nothing == 0);", "print(m != 0);", "free(m);")),
+      expected: "1\n1\n1\n1", memcheck: true, leaks: true },
+    { name: "ptr: a pointer to pointers",
+      source: MEM + main(lines("var ptr<u8> m = malloc(32);", "var ptr<ptr<u8>> table = ptr<ptr<u8>>(m);", "table[0] = m + 16;",
+                               "var ptr<u8> inner = table[0];", "inner[0] = 7;", "print(m[16]);", "free(m);")),
+      expected: "7", memcheck: true, leaks: true },
+    { name: "ptr: pointers as parameters, return values and globals",
+      source: MEM + `var ptr<u8> BUF = 0;\nfunction at(ptr<u8> p, int i): ptr<u8> { return p + i; }\nfunction fill(ptr<u8> p, int n, u8 v) {\n    var i = 0;\n    while (i < n) {\n        p[i] = v;\n        i++;\n    }\n    return 0;\n}\n` +
+              main(lines("BUF = malloc(16);", "fill(BUF, 16, 9);", "var ptr<u8> p = at(BUF, 3);", "p[0] = 1;", "print(BUF[2] + BUF[3] + BUF[4]);", "free(BUF);")),
+      expected: "19", memcheck: true, leaks: true },
+    { name: "ptr: every read happens (reads through pointers aren't merged)",
+      source: MEM + main(lines("var ptr<u8> m = malloc(4);", "var ptr<u8> alias = m;", "m[0] = 1;", "var x = alias[0];", "m[0] = 2;", "var y = alias[0];",
+                               "print(x);", "print(y);", "var total = 0;", "var i = 0;", "while (i < 3) {", "    m[0] += 1;", "    total += alias[0];", "    i++;", "}", "print(total);", "free(m);")),
+      expected: "1\n2\n12", memcheck: true, leaks: true },
+    { name: "ptr: mismatched pointer types need a cast",
+      source: main(lines("var ptr<u8> p = 0x1000;", "var ptr<u16> q = p;")), shouldError: true, errorMatch: /declared ptr<u16>, inferred ptr<u8> \(use ptr<u16>\(\.\.\.\) to convert\)/ },
+    { name: "ptr: an int variable isn't an address without a cast",
+      source: main(lines("var int a = 4096;", "var ptr<u8> p = a;")), shouldError: true, errorMatch: /use ptr<u8>\(\.\.\.\) to convert/ },
+    { name: "ptr: can't point at a string or a regular struct",
+      source: `struct S {\n    var n: int;\n}\n` + main(lines("var ptr<string> p = 0x1000;", "var ptr<S> q = 0x1000;")), shouldError: true,
+      errorMatch: /ptr<string>: a pointer can point at[^\n]*\nError: [^\n]*ptr<S>: S isn't a packed struct/ },
+    { name: "ptr: only whole numbers add to a pointer",
+      source: main(lines("var ptr<u8> p = 0x1000;", "var ptr<u8> q = p + p;")), shouldError: true, errorMatch: /Can't use '\+' on ptr<u8> and ptr<u8>/ },
+    { name: "ptr: an index must be a whole number",
+      source: main(lines("var ptr<u8> p = 0x1000;", "print(p[1.5]);")), shouldError: true, errorMatch: /A pointer index must be a whole number, not float/ },
+
+    // packed structs
+    { name: "packed: sizeof and field offsets",
+      source: `packed struct Entry {\n    var low: u16;\n    var sel: u16;\n    var ist: u8;\n    var flags: u8;\n    var mid: u16;\n    var high: u32;\n    var zero: u32;\n}\n` +
+              main(lines("print(sizeof(Entry));", "var ptr<Entry> e = 0x1000;", "print(u64(addr(e.flags)) - 0x1000);", "print(u64(addr(e[2].high)) - 0x1000);",
+                         "print(sizeof(u16) + sizeof(ptr<u8>) + sizeof(int) + sizeof(i32));")),
+      expected: "16\n5\n40\n22" },
+    { name: "packed: write and read fields through a pointer",
+      source: MEM + `packed struct Entry {\n    var low: u16;\n    var sel: u16;\n    var ist: u8;\n    var flags: u8;\n    var mid: u16;\n    var high: u32;\n    var zero: u32;\n}\n` +
+              main(lines("var ptr<u8> m = malloc(64);", "var ptr<Entry> idt = ptr<Entry>(m);", "idt[1].low = 0xBEEF;", "idt[1].flags = 0x8E;", "idt[1].high = 0xFFFFFFFF;",
+                         "print(idt[1].low);", "print(idt[1].flags);", "print(idt[1].high);", "print(m[16]);", "print(m[21]);", "free(m);")),
+      expected: "48879\n142\n4294967295\n239\n142", memcheck: true, leaks: true },
+    { name: "packed: p.field is p[0].field",
+      source: MEM + `packed struct Ptr {\n    var limit: u16;\n    var base: u64;\n}\n` +
+              main(lines("var ptr<u8> m = malloc(16);", "var ptr<Ptr> r = ptr<Ptr>(m);", "r.limit = 4095;", "r.base = 0x1000;", "print(sizeof(Ptr));",
+                         "print(r[0].limit);", "print(r.base);", "print(m[2]);", "free(m);")),
+      expected: "10\n4095\n4096\n0", memcheck: true, leaks: true },
+    { name: "packed: nested packed structs are laid out inline",
+      source: MEM + `packed struct Inner {\n    var a: u8;\n    var b: u16;\n}\npacked struct Outer {\n    var tag: u8;\n    var inner: Inner;\n    var last: i16;\n}\n` +
+              main(lines("print(sizeof(Outer));", "var ptr<u8> m = malloc(16);", "var ptr<Outer> o = ptr<Outer>(m);", "o.inner.b = 0x0102;", "o.last = -2;",
+                         "print(m[2]);", "print(m[3]);", "print(o.last);", "print(o.inner.b);", "free(m);")),
+      expected: "6\n2\n1\n-2\n258", memcheck: true, leaks: true },
+    { name: "packed: compound assignment on a field wraps",
+      source: MEM + `packed struct Flags {\n    var f: u8;\n}\n` +
+              main(lines("var ptr<u8> m = malloc(4);", "var ptr<Flags> p = ptr<Flags>(m);", "p.f = 0x80;", "p.f |= 0x0E;", "print(p.f);", "p.f += 0x80;", "print(p.f);", "free(m);")),
+      expected: "142\n14", memcheck: true, leaks: true },
+    { name: "packed: unknown field",
+      source: `packed struct P {\n    var a: u8;\n}\n` + main(lines("var ptr<P> p = 0x1000;", "p.b = 1;")), shouldError: true, errorMatch: /Unknown field 'b' on packed struct 'P'/ },
+    { name: "packed: a whole struct isn't a value",
+      source: `packed struct P {\n    var a: u8;\n}\n` + main(lines("var ptr<P> p = 0x1000;", "var x = p[0];")), shouldError: true, errorMatch: /A whole P can't be read as a value/ },
+    { name: "packed: fields must have a size",
+      source: `packed struct P {\n    var s: string;\n}\n` + main(`print(1);`), shouldError: true, errorMatch: /Field s of packed struct P can't be string/ },
+    { name: "packed: can't contain itself",
+      source: `packed struct P {\n    var a: u8;\n    var p: P;\n}\n` + main(`print(1);`), shouldError: true, errorMatch: /packed struct P contains itself/ },
+    { name: "packed: only fields, no defaults",
+      source: `packed struct P {\n    var a: u8 = 1;\n}\n` + main(`print(1);`), shouldError: true, errorMatch: /packed struct fields can't have defaults/ },
+
+    // addr and sizeof
+    { name: "addr: a global's address",
+      source: `var int counter = 7;\nvar u8 small = 1;\n` + main(lines("var ptr<int> p = ptr<int>(addr(counter));", "p[0] = p[0] + 1;", "print(counter);",
+                         "var ptr<u8> s = ptr<u8>(addr(small));", "s[0] = 200;", "print(small);")),
+      expected: "8\n200" },
+    { name: "addr: a function's address",
+      source: `function twice(int x): int { return x * 2; }\n` + main(lines("var u64 a = addr(twice);", "print(a != 0);", "print(a == addr(twice));")),
+      expected: "1\n1" },
+    { name: "addr: a local variable has no lasting address",
+      source: main(lines("var int x = 5;", "print(addr(x));")), shouldError: true, errorMatch: /addr\(x\): x is a local variable/ },
+    { name: "sizeof: basic types",
+      source: main(lines("print(sizeof(u8));", "print(sizeof(i16));", "print(sizeof(u32));", "print(sizeof(u64));", "print(sizeof(int));", "print(sizeof(ptr<u8>));", "print(sizeof(char));")),
+      expected: "1\n2\n4\n8\n8\n8\n1" },
+    { name: "sizeof: a type without a size is an error",
+      source: main(`print(sizeof(string));`), shouldError: true, errorMatch: /sizeof\(string\): only sized integers/ },
+
+    // extern fn
+    { name: "extern: malloc, memset and free from C",
+      source: MEM + `extern fn memset(ptr<u8> p, int c, u64 n): ptr<u8>;\n` +
+              main(lines("var ptr<u8> m = malloc(8);", "var ptr<u8> same = memset(m, 0x41, 8);", "print(same == m);", "print(m[7]);", "free(m);")),
+      expected: "1\n65", memcheck: true, leaks: true },
+    { name: "extern: a small return type is cut to size",
+      source: `extern fn abs(int x): u8;\n` + main(lines("print(abs(-300));", "var u8 r = abs(-5);", "print(r);")),
+      expected: "44\n5", libc: true },
+    { name: "extern: arguments are checked",
+      source: `extern fn f(u8 x): int;\n` + main(lines("var int big = 300;", "print(f(big));")), shouldError: true, errorMatch: /Argument 1 of f should be u8, not int/ },
+    { name: "extern: only numbers and pointers cross",
+      source: `extern fn f(string s);\n` + main(`print(1);`), shouldError: true, errorMatch: /Parameter s of extern fn f can't be string/ },
+    { name: "extern: no body",
+      source: `extern fn f(int x): int { return x; }\n` + main(`print(1);`), shouldError: true, errorMatch: /an extern function has no body/ },
+
+    // port I/O (the instructions need ring 0, so these only check types; IRTests.js checks the assembly)
+    { name: "ports: inb returns a u8",
+      source: main(lines("var u8 x = 0;", "if (x == 1) {", "    var u8 sc = inb(0x60);", "    var u32 l = inl(0xCF8);", "    outw(0x1F0, u16(sc));", "    outl(0xCF8, l);", "}", "print(x);")),
+      expected: "0" },
+    { name: "ports: outb's value must be a u8",
+      source: main(lines("var int v = 5;", "outb(0x20, v);")), shouldError: true, errorMatch: /Argument 2 of outb should be u8, not int \(use u8\(\.\.\.\) to convert\)/ },
+    { name: "ports: a port number that doesn't fit",
+      source: main(`outb(70000, 1);`), shouldError: true, errorMatch: /70000 doesn't fit: a u16 holds 0 to 65535/ },
+    { name: "ports: inw into a u8 needs a cast",
+      source: main(lines("var u8 x = 0;", "if (x == 1) { var u8 w = inw(0x1F0); }")), shouldError: true, errorMatch: /declared u8, inferred u16/ },
+
+    // globals set to a plain number hold it from the start (B62)
+    { name: "globals: a number global is set before other globals are set up (B62)",
+      source: `var int[] SQUARES = make_squares();\nvar int COUNT = 4;\nvar ptr<u8> BASE = 0x1000;\nfunction make_squares(): int[] {\n    var int[] xs = [];\n    var i = 0;\n    while (i < COUNT) {\n        xs.push(i * i);\n        i++;\n    }\n    return xs;\n}\n` +
+              main(lines("print(SQUARES.len());", "print(SQUARES[3]);", "print(u64(BASE));", "COUNT = COUNT + 1;", "print(COUNT);")),
+      expected: "4\n9\n4096\n5", memcheck: true, leaks: true },
+
+    // interrupt fn (the handlers themselves run in QEMU: KernelTests.js)
+    { name: "interrupt fn: compiles, and addr() gives its entry point",
+      source: `interrupt fn on_tick(ptr<InterruptFrame> frame) {\n    return 0;\n}\ninterrupt fn on_fault(ptr<InterruptFrame> frame, u64 error_code) {\n    print(frame.rip + error_code);\n    return 0;\n}\n` +
+              main(lines("print(addr(on_tick) != 0);", "print(addr(on_tick) != addr(on_fault));", "print(sizeof(InterruptFrame));")),
+      expected: "1\n1\n40" },
+    { name: "interrupt fn: can't be called from L",
+      source: `interrupt fn on_tick(ptr<InterruptFrame> frame) {\n    return 0;\n}\n` + main(`on_tick(0);`), shouldError: true,
+      errorMatch: /on_tick is an interrupt fn: the CPU calls it \(put addr\(on_tick\) in the IDT\), L code can't/ },
+    { name: "interrupt fn: isn't a function value",
+      source: `interrupt fn on_tick(ptr<InterruptFrame> frame) {\n    return 0;\n}\n` + main(`var f = on_tick;`), shouldError: true,
+      errorMatch: /on_tick is an interrupt fn: use addr\(on_tick\) for its address/ },
+    { name: "interrupt fn: takes a frame and optionally an error code",
+      source: `interrupt fn bad(int x) {\n    return 0;\n}\n` + main(`print(1);`), shouldError: true,
+      errorMatch: /interrupt fn bad takes \(ptr<InterruptFrame> frame\)/ },
+    { name: "interrupt fn: no more than frame and error code",
+      source: `interrupt fn bad(ptr<InterruptFrame> f, u64 e, u64 extra) {\n    return 0;\n}\n` + main(`print(1);`), shouldError: true,
+      errorMatch: /interrupt fn bad takes/ },
+    { name: "interrupt fn: the frame's fields can be changed",
+      source: MEM + `interrupt fn h(ptr<InterruptFrame> frame) {\n    return 0;\n}\n` +
+              main(lines("var ptr<InterruptFrame> f = ptr<InterruptFrame>(malloc(40));", "f.rip = 100;", "f.rip += 2;", "f.ss = 0x10;", "print(f.rip);", "print(f.ss);", "free(ptr<u8>(f));")),
+      expected: "102\n16", memcheck: true, leaks: true },
 
     // ── Allocator stress (also run with --nolibc to check runtime/nolibc.c's allocator) ──
 

@@ -1,6 +1,5 @@
-import { lookup } from "node:dns/promises";
-import { Node } from "./Parser";
-import { lookupStruct, tupleTypeParts, fnTypeParts, mapTypeParts } from "./Scope";
+import { Node, SIZED_INTS } from "./Parser";
+import { lookupStruct, tupleTypeParts, fnTypeParts, mapTypeParts, isSizedInt, isSmallInt, isPtrType, sizeOfType } from "./Scope";
 import { findFreshFunctions } from "./Fresh";
 
 export type IR =
@@ -11,23 +10,31 @@ export type IR =
     | {op: "call", dst?: string, fn: string, args: string[], returns_string?: boolean, returns_float?: boolean, returns_heap?: boolean, retType?: string}
     | {op: "eq", dst: string, a: string, b: string}
     | {op: "neq", dst: string, a: string, b: string}
-    | {op: "lt", dst: string, a: string, b: string}
-    | {op: "lte", dst: string, a: string, b: string}
-    | {op: "gt", dst: string, a: string, b: string}
-    | {op: "gte", dst: string, a: string, b: string}
+    | {op: "lt", dst: string, a: string, b: string, unsigned?: boolean}    // unsigned: u64 values and addresses
+    | {op: "lte", dst: string, a: string, b: string, unsigned?: boolean}
+    | {op: "gt", dst: string, a: string, b: string, unsigned?: boolean}
+    | {op: "gte", dst: string, a: string, b: string, unsigned?: boolean}
     | {op: "str_eq", dst: string, a: string, b: string}
     | {op: "str_neq", dst: string, a: string, b: string}
     | {op: "str_dup", dst: string, src: string}
     | {op: "add", dst: string, a: string, b: string}
     | {op: "sub", dst: string, a: string, b: string}
     | {op: "mul", dst: string, a: string, b: string}
-    | {op: "div", dst: string, a: string, b: string}
+    | {op: "div", dst: string, a: string, b: string, unsigned?: boolean}
     | {op: "and", dst: string, a: string, b: string}
     | {op: "or", dst: string, a: string, b: string}
     | {op: "xor", dst: string, a: string, b: string}
     | {op: "not", dst: string, src: string}
     | {op: "shl", dst: string, a: string, b: string}
-    | {op: "shr", dst: string, a: string, b: string}
+    | {op: "shr", dst: string, a: string, b: string}      // logical: u64
+    | {op: "sar", dst: string, a: string, b: string}      // arithmetic (keeps the sign): int and the signed types
+    | {op: "bnot", dst: string, src: string}              // ~x (not is !x)
+    | {op: "trunc", dst: string, src: string, type: string}   // cut a value to a sized integer type (u8, i16, ...)
+    | {op: "mem_load", dst: string, addr: string, size: number, signed: boolean}   // read raw memory; never removed or merged
+    | {op: "mem_store", addr: string, src: string, size: number}                   // write raw memory; never removed
+    | {op: "global_addr", dst: string, name: string}      // the address of a global variable
+    | {op: "extern_decl", name: string}                   // a function defined outside L (extern fn)
+    | {op: "isr_stub", name: string, fn: string, errorCode: boolean}   // interrupt fn `name`: saves everything, calls fn, iretq
     | {op: "load", dst: string, addr: string, type: string}
     | {op: "store", addr: string, src: string, type: string}
     | {op: "alloc", dst: string, size: string | number, heapFields?: number[], type?: string}   // type: a tuple, e.g. "(string,int)"
@@ -64,7 +71,7 @@ export type IR =
     | {op: "phi", dst: string, branches: {label: string, src: string}[]}
     | {op: "neg", dst: string, src: string}
     | {op: "abs", dst: string, src: string}
-    | {op: "mod", dst: string, a: string, b: string}
+    | {op: "mod", dst: string, a: string, b: string, unsigned?: boolean}
     | {op: "array_new", dst: string, size: string | number, type?: string}   // type: e.g. "int[]", "string[]", "P[]"
     | {op: "array_store", arr: string, index: string, src: string, elemType?: string}
     | {op: "array_load", dst: string, arr: string, index: string, is_string?: boolean, is_float?: boolean}
@@ -144,8 +151,10 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
 
     // declared return types (function f(): string) win over what was learned from the returns
     const declaredRet = new Map<string, string>();
+    const externFns = new Set<string>();
     (function collect(n: Node) {
-        if (n.type === "Function" && n.varType) declaredRet.set(n.value!, n.varType);
+        if (n.type === "ExternFn") externFns.add(n.value!);
+        if ((n.type === "Function" || n.type === "ExternFn") && n.varType) declaredRet.set(n.value!, n.varType);
         if (n.type === "StructMethod" && n.varType) declaredRet.set("." + n.value!, n.varType);
         n.children.forEach(collect);
     })(ast);
@@ -224,6 +233,8 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
                 return "int";
             }
             case "Unary": return typeOf(n.children[0]);
+            case "Cast": case "PtrLoad": return n.varType;
+            case "AddrOf": return "u64";
             default: return undefined;
         }
     }
@@ -624,6 +635,29 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
     // set while generating the field in `x.f == none`, so that read skips the never-set check
     let readingForNoneCheck = false;
 
+    // the address of a PtrLoad / PtrStore / AddrOf: pointer + index * element size + field offset
+    function ptrAddress(node: Node): string {
+        const { scale, offset } = node.ptr!;
+        let addr = genExpr(node.children[0]);
+        let constOffset = offset;
+        const idx = node.children[1];
+        if (idx.type === "Number" && /^\d+$/.test(idx.value!)) {
+            constOffset += Number(idx.value) * scale;
+        } else {
+            let i = genExpr(idx);
+            if (scale !== 1) { const scaled = fresh(); emit({ op: "mul", dst: scaled, a: i, b: String(scale) }); i = scaled; }
+            const sum = fresh();
+            emit({ op: "add", dst: sum, a: addr, b: i });
+            addr = sum;
+        }
+        if (constOffset !== 0) {
+            const at = fresh();
+            emit({ op: "add", dst: at, a: addr, b: String(constOffset) });
+            addr = at;
+        }
+        return addr;
+    }
+
     function genExpr(node: Node): string {
         switch (node.type) {
             case "MapLiteral": {
@@ -852,8 +886,35 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
                     }
                 } else if (node.value === "!") {
                     emit({ op: "not", dst, src });
+                } else if (node.value === "~") {
+                    emit({ op: "bnot", dst, src });
                 }
                 return dst;
+            }
+
+            case "Cast": {
+                let v = genExpr(node.children[0]);
+                if (floatTemps.has(v)) { const c = fresh(); emit({ op: "ftoi", dst: c, src: v }); v = c; }
+                // int, u64 and pointers are the same 64 bits; smaller types are cut to size
+                if (!isSmallInt(node.varType)) return v;
+                const dst = fresh();
+                emit({ op: "trunc", dst, src: v, type: node.varType! });
+                return dst;
+            }
+
+            case "PtrLoad": {
+                const addr = ptrAddress(node);
+                const t = String(node.varType);
+                const dst = fresh();
+                emit({ op: "mem_load", dst, addr, size: sizeOfType(t)!, signed: t === "int" || !!SIZED_INTS[t]?.signed });
+                return dst;
+            }
+
+            case "AddrOf": {
+                const dst = fresh();
+                if (node.varType === "function") { emit({ op: "func_addr", dst, fn: node.value! }); return dst; }
+                if (node.varType === "global") { emit({ op: "global_addr", dst, name: node.value! }); return dst; }
+                return ptrAddress(node);
             }
             case "Number": {
                 const dst = fresh();
@@ -920,6 +981,16 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
                     emit({ op: "label", name: labelEnd });
                     const dst = fresh();
                     emit({ op: "mov", dst, src: slot });
+                    return dst;
+                }
+
+                // p + n / p - n: n elements of the pointer's type
+                if (node.ptr && (node.value === "+" || node.value === "-")) {
+                    const p = genExpr(node.children[0]);
+                    let n = genExpr(node.children[1]);
+                    if (node.ptr.scale !== 1) { const scaled = fresh(); emit({ op: "mul", dst: scaled, a: n, b: String(node.ptr.scale) }); n = scaled; }
+                    const dst = fresh();
+                    emit({ op: node.value === "+" ? "add" : "sub", dst, a: p, b: n });
                     return dst;
                 }
 
@@ -1002,10 +1073,12 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
                     "==": "eq", "!=": "neq",
                     "<": "lt",  "<=": "lte",
                     ">": "gt",  ">=": "gte",
+                    "&": "and", "|": "or", "^": "xor", "<<": "shl", ">>": node.unsigned ? "shr" : "sar",
                 };
                 const op = opMap[node.value!];
                 if (!op) throw new Error(`Unknown binary op: ${node.value}`);
-                emit({ op, dst, a, b } as IR);
+                const unsigned = node.unsigned && ["lt", "lte", "gt", "gte", "div", "mod"].includes(op);
+                emit({ op, dst, a, b, ...(unsigned ? { unsigned: true } : {}) } as IR);
                 return dst;
             }
 
@@ -1067,6 +1140,12 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
 
                 emit({ op: "call", dst, fn: node.value!, args, returns_string: returnsString, returns_float: returnsFloat,
                        returns_heap: returnsHeap, retType: returnsHeap ? known : undefined });
+                // an assembly/C function returning a u8 (say) only sets the low bits of rax
+                if (externFns.has(node.value!) && isSmallInt(known)) {
+                    const cut = fresh();
+                    emit({ op: "trunc", dst: cut, src: dst, type: known! });
+                    return cut;
+                }
                 return dst;
             }
 
@@ -1078,7 +1157,9 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
 
             case "CompoundAssign": {
                 const name = node.children[0].value!;
-                const rhs = genExpr(node.children[1]);
+                let rhs = genExpr(node.children[1]);
+                // p += n moves n elements
+                if (node.ptr && node.ptr.scale !== 1) { const scaled = fresh(); emit({ op: "mul", dst: scaled, a: rhs, b: String(node.ptr.scale) }); rhs = scaled; }
                 const cur = fresh();
                 const result = fresh();
                 emit({ op: "mov", dst: cur, src: name });
@@ -1091,8 +1172,13 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
                                     : { op: "add", dst: result, a: cur, b: rhs }); break;
                     case "-=": emit(isFloatOp ? { op: "fsub", dst: result, a: asFloat(cur), b: asFloat(rhs) } : { op: "sub", dst: result, a: cur, b: rhs }); break;
                     case "*=": emit(isFloatOp ? { op: "fmul", dst: result, a: asFloat(cur), b: asFloat(rhs) } : { op: "mul", dst: result, a: cur, b: rhs }); break;
-                    case "/=": emit(isFloatOp ? { op: "fdiv", dst: result, a: asFloat(cur), b: asFloat(rhs) } : { op: "div", dst: result, a: cur, b: rhs }); break;
-                    case "%=": emit({ op: "mod", dst: result, a: cur, b: rhs }); break;
+                    case "/=": emit(isFloatOp ? { op: "fdiv", dst: result, a: asFloat(cur), b: asFloat(rhs) } : { op: "div", dst: result, a: cur, b: rhs, ...(node.unsigned ? { unsigned: true } : {}) }); break;
+                    case "%=": emit({ op: "mod", dst: result, a: cur, b: rhs, ...(node.unsigned ? { unsigned: true } : {}) }); break;
+                    case "&=": emit({ op: "and", dst: result, a: cur, b: rhs }); break;
+                    case "|=": emit({ op: "or", dst: result, a: cur, b: rhs }); break;
+                    case "^=": emit({ op: "xor", dst: result, a: cur, b: rhs }); break;
+                    case "<<=": emit({ op: "shl", dst: result, a: cur, b: rhs }); break;
+                    case ">>=": emit({ op: node.unsigned ? "shr" : "sar", dst: result, a: cur, b: rhs }); break;
                 }
                 if (isFloatOp) floatTemps.add(result);
                 if (isStringOp) stringVars.add(result);
@@ -1102,28 +1188,23 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
                     stored = fresh();
                     emit({ op: "ftoi", dst: stored, src: result });
                 }
+                // a sized variable wraps to its size
+                if (node.truncTo) { const cut = fresh(); emit({ op: "trunc", dst: cut, src: stored, type: node.truncTo }); stored = cut; }
                 emit({ op: "mov", dst: name, src: stored });
                 return name;
             }
 
-            case "PostfixInc": {
-                const name = node.value!;
-                const cur = fresh();
-                const result = fresh();
-                emit({ op: "mov", dst: cur, src: name });
-                emit({ op: "add", dst: result, a: cur, b: "1" });
-                emit({ op: "mov", dst: name, src: result });
-                return cur; // return old value (true postfix semantics)
-            }
-
+            case "PostfixInc":
             case "PostfixDec": {
                 const name = node.value!;
                 const cur = fresh();
-                const result = fresh();
+                let result = fresh();
                 emit({ op: "mov", dst: cur, src: name });
-                emit({ op: "sub", dst: result, a: cur, b: "1" });
+                // a pointer moves one element; a sized variable wraps
+                emit({ op: node.type === "PostfixInc" ? "add" : "sub", dst: result, a: cur, b: String(node.ptr?.scale ?? 1) });
+                if (node.truncTo) { const cut = fresh(); emit({ op: "trunc", dst: cut, src: result, type: node.truncTo }); result = cut; }
                 emit({ op: "mov", dst: name, src: result });
-                return cur;
+                return cur; // return old value (true postfix semantics)
             }
 
             case "Char": {
@@ -1207,6 +1288,14 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
 
     function genStmt(node: Node) {
         switch (node.type) {
+
+            case "PtrStore": {
+                const addr = ptrAddress(node);
+                let val = genExpr(node.children[2]);
+                if (floatTemps.has(val)) { const c = fresh(); emit({ op: "ftoi", dst: c, src: val }); val = c; }
+                emit({ op: "mem_store", addr, src: val, size: sizeOfType(String(node.varType))! });
+                break;
+            }
 
             case "FieldAssign": {
                 // the parser gives 'this.x = v' an Identifier "this" target; treat it as This
@@ -1493,7 +1582,9 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
 
         currentFunction = node.value!;
         currentRetKey = node.value!;
-        emit({ op: "enter", name: node.value!, params });
+        // an interrupt fn: the CPU jumps to a stub under its name, which calls the body (__isr_<name>)
+        const fnName = node.interrupt ? `__isr_${node.value}` : node.value!;
+        emit({ op: "enter", name: fnName, params });
         for (const v of [...varTypes.keys()]) { if (!globalNames.has(v)) varTypes.delete(v); }
         for (const v of [...tupleStrings.keys()]) { if (!/^t\d+$/.test(v) && !globalNames.has(v)) tupleStrings.delete(v); }
 
@@ -1528,6 +1619,8 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
 
         genStmt(body);
         emit({ op: "leave" });
+        // after the body, so it never sits before the first function (where global set-up code goes)
+        if (node.interrupt) emit({ op: "isr_stub", name: node.value!, fn: fnName, errorCode: params.length === 2 });
     }
 
     function genStructDef(node: Node) {
@@ -1590,6 +1683,7 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
     }
 
     function genProgram(node: Node) {
+        for (const child of node.children) if (child.type === "ExternFn") emit({ op: "extern_decl", name: child.value! });
         // global initialisers first: everything before the first function is the code that
         // sets up globals (Emitter.ts runs it at the start of main, insertFrees treats its names as globals)
         node.children.forEach(child => { if (child.type === "VarDecl") genStmt(child); });
@@ -1611,10 +1705,7 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
             globalFloatNames.add(c.value!);
         }
     }
-    for (const fn of ast.children.filter(c => c.type === "Function")) {
-        functionParamTypes.set(fn.value!, fn.children.filter(c => c.type === "Identifier").map(c => c.varType));
-    }
-    for (const fn of ast.children.filter(c => c.type === "Function")) {
+    for (const fn of ast.children.filter(c => c.type === "Function" || c.type === "ExternFn")) {
         functionParamTypes.set(fn.value!, fn.children.filter(c => c.type === "Identifier").map(c => c.varType));
     }
     let known: number;
@@ -1653,7 +1744,8 @@ function structNamesInProgram(ast: Node): string[] {
 
 // types held on the heap (strings, arrays, structs, tuples)
 export function isHeapT(t: string | undefined): boolean {
-    return !!t && t !== "int" && t !== "float" && t !== "bool" && t !== "char" && t !== "void" && t !== "unknown" && !t.startsWith("fn(");
+    return !!t && t !== "int" && t !== "float" && t !== "bool" && t !== "char" && t !== "void" && t !== "unknown" && !t.startsWith("fn(") &&
+        !isSizedInt(t) && !isPtrType(t);
 }
 
 export function printIR(instructions: IR[]): string {
@@ -1753,11 +1845,32 @@ export function printIR(instructions: IR[]): string {
                 break;
             case "add": case "sub": case "mul": case "div":
             case "mod": case "and": case "or":  case "xor":
-            case "shl": case "shr":
+            case "shl": case "shr": case "sar":
             case "eq":  case "neq":
             case "lt":  case "lte":
             case "gt":  case "gte":
-                lines.push(`  ${instr.op.padEnd(9)} ${instr.dst} = ${instr.a} ${instr.op} ${instr.b}`);
+                lines.push(`  ${instr.op.padEnd(9)} ${instr.dst} = ${instr.a} ${instr.op}${(instr as any).unsigned ? " unsigned" : ""} ${instr.b}`);
+                break;
+            case "bnot":
+                lines.push(`  bnot      ${instr.dst} = ~${instr.src}`);
+                break;
+            case "trunc":
+                lines.push(`  trunc     ${instr.dst} = ${instr.type}(${instr.src})`);
+                break;
+            case "mem_load":
+                lines.push(`  mem_load  ${instr.dst} = ${instr.signed ? "i" : "u"}${instr.size * 8} [${instr.addr}]`);
+                break;
+            case "mem_store":
+                lines.push(`  mem_store ${instr.size * 8}-bit [${instr.addr}] = ${instr.src}`);
+                break;
+            case "global_addr":
+                lines.push(`  global_addr ${instr.dst} = &${instr.name}`);
+                break;
+            case "extern_decl":
+                lines.push(`; extern ${instr.name}`);
+                break;
+            case "isr_stub":
+                lines.push(`; interrupt stub ${instr.name} -> ${instr.fn}${instr.errorCode ? " (with error code)" : ""}`);
                 break;
             case "neg": case "not": case "abs":
             case "itof": case "ftoi":

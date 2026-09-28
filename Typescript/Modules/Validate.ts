@@ -1,5 +1,6 @@
-import { Node } from "./Parser";
-import { SymbolEntry, Scope, resolve, createScope, define, registerStruct, StructDef, lookupStruct, StructField, tupleTypeParts, fnTypeParts, mapTypeParts } from "./Scope";
+import { Node, SIZED_INTS } from "./Parser";
+import { SymbolEntry, Scope, resolve, createScope, define, registerStruct, StructDef, lookupStruct, StructField, tupleTypeParts, fnTypeParts, mapTypeParts,
+         isSizedInt, isSmallInt, isPtrType, ptrElem, isPackedStruct, packedLayout, sizeOfType } from "./Scope";
 import { Ltype } from "./Scope";
 import { findFreshFunctions, isFreshHeapExpr } from "./Fresh";
 
@@ -29,7 +30,10 @@ function validateStatement(c: Node, scope: Scope) {
 // Scalars (int, float, bool, char) and strings are values: assigning one copies it. Arrays,
 // structs and tuples are heap values that variables share by pointer.
 // a function value (fn(int): int) is a plain address, copied like a number
-const isScalar = (t: Ltype | undefined) => t === "int" || t === "float" || t === "bool" || t === "char" || t === "string" || !!t?.startsWith("fn(");
+const isScalar = (t: Ltype | undefined) => t === "int" || t === "float" || t === "bool" || t === "char" || t === "string" || !!t?.startsWith("fn(") ||
+    isSizedInt(t) || isPtrType(t);
+// whole numbers: int, char, bool and the sized integers
+const isIntLike = (t: Ltype | undefined) => t === "int" || t === "char" || t === "bool" || isSizedInt(t);
 const isHeapType = (t: Ltype | undefined) => !!t && !isScalar(t) && t !== "unknown" && t !== "void";
 const elemOf = (t: Ltype | undefined): Ltype | undefined => t?.endsWith("[]") ? t.slice(0, -2) : mapTypeParts(t)?.value;
 const isMapType = (t: Ltype | undefined) => !!mapTypeParts(t);
@@ -66,12 +70,14 @@ let mutates = new Map<string, Set<number>>();            // function -> params w
 let paramTypes = new Map<string, (string | undefined)[]>(); // function -> declared parameter types
 let currentReturnType: Ltype | undefined;                // the declared return type of the function being checked
 let methodParamTypes = new Map<string, (string | undefined)[]>();   // "Struct.method" -> declared parameter types
+let interruptFns = new Set<string>();                    // interrupt fn names: the CPU calls them, L code can't
 
 // built-ins' parameter types ("any" accepts anything)
 const BUILTIN_PARAMS: Record<string, string[]> = {
     print: ["any"], printchar: ["int"], len: ["string"], inttostr: ["int"], strtoint: ["string"],
     chartostr: ["char"], str_upper: ["string"], str_lower: ["string"],
     str_find: ["string", "string"], str_contains: ["string", "string"], floattostr: ["float"],
+    inb: ["u16"], inw: ["u16"], inl: ["u16"], outb: ["u16", "u8"], outw: ["u16", "u16"], outl: ["u16", "u32"],
 };
 
 // arguments must fit their parameters the way a value fits a variable: numbers convert, a child
@@ -82,7 +88,7 @@ function checkArgs(fn: string, want: (string | undefined)[] | undefined, args: N
         if (!t || t === "any" || t === "unknown" || !arg) return;
         adoptLiteralType(arg, t);
         const got = inferType(arg, scope);
-        if (!fits(t, got)) err(arg, `Argument ${i + 1} of ${fn} should be ${t}, not ${got}`);
+        if (!fits(t, got)) err(arg, `Argument ${i + 1} of ${fn} should be ${t}, not ${got}${lowLevelHint(t, arg)}`);
     });
 }
 
@@ -467,8 +473,34 @@ function binaryType(node: Node, scope: Scope): Ltype {
     const op = node.value!;
     const left = inferType(node.children[0], scope);
     const right = inferType(node.children[1], scope);
-    const numeric = (t: Ltype) => t === "int" || t === "float" || t === "char" || t === "bool";
+    const numeric = (t: Ltype) => t === "int" || t === "float" || t === "char" || t === "bool" || isSizedInt(t);
     const known = left !== "unknown" && right !== "unknown";
+    // u64 compares, divides and shifts right as unsigned
+    if (left === "u64" || right === "u64") node.unsigned = true;
+    if (op === ">>") node.unsigned = left === "u64";
+
+    // pointers: p + n and p - n move by n elements; pointers compare with pointers (or a literal address)
+    if (isPtrType(left) || isPtrType(right)) {
+        if (["==", "!=", "<", "<=", ">", ">="].includes(op)) {
+            const ok = (isPtrType(left) && isPtrType(right)) ||
+                (isPtrType(left) ? literalValue(node.children[1]) : literalValue(node.children[0])) !== undefined;
+            if (!ok) err(node, `Can't compare ${left} with ${right}: use u64(...) to compare an address with a number`);
+            node.unsigned = true;
+            return "bool";
+        }
+        if ((op === "+" || op === "-") && isPtrType(left) && (isIntLike(right) || right === "unknown")) {
+            checkLowLevelType(left, node);
+            node.ptr = { scale: sizeOfType(ptrElem(left)!)!, offset: 0 };
+            return left;
+        }
+        err(node, `Can't use '${op}' on ${left} and ${right} (a pointer only adds or subtracts a whole number)`);
+    }
+
+    // bitwise operators need whole numbers
+    if (["&", "|", "^", "<<", ">>"].includes(op)) {
+        for (const t of [left, right]) if (t !== "unknown" && !isIntLike(t)) err(node, `'${op}' needs whole numbers, not ${t}`);
+        return left === "u64" || (op !== "<<" && op !== ">>" && right === "u64") ? "u64" : "int";
+    }
     const bothNumeric = numeric(left) && numeric(right);
     const bothStrings = left === "string" && right === "string";
     const mismatch = (): never => err(node, `Type mismatch: can't use '${op}' on ${left} and ${right}`);
@@ -498,9 +530,11 @@ function binaryType(node: Node, scope: Scope): Ltype {
     if (op === "%" && (left === "float" || right === "float")) {
         err(node, `'%' needs whole numbers; use math_fmod for floats`);
     }
-    if (!known) return left === "unknown" ? right : left;
+    if (!known) { const t = left === "unknown" ? right : left; return isSmallInt(t) ? "int" : t; }
     if (!bothNumeric) mismatch();
-    return left === "float" || right === "float" ? "float" : "int";
+    // like C, arithmetic on sized integers is done at full width: u8 + u8 is an int (so attr << 8
+    // doesn't lose bits), and storing it back into a u8 needs a cast
+    return left === "float" || right === "float" ? "float" : left === "u64" || right === "u64" ? "u64" : "int";
 }
 
 // `child` is `ancestor` or extends it (directly or through its parents)
@@ -521,6 +555,7 @@ function commonAncestor(names: string[]): string | undefined {
 // the declared struct, or a tuple whose elements each fit (an unknown element is accepted)
 function fits(declared: string, inferred: string): boolean {
     if (declared === inferred || inferred === "unknown") return true;
+    if (isSizedInt(declared) || isSizedInt(inferred) || isPtrType(declared) || isPtrType(inferred)) return fitsLowLevel(declared, inferred);
     if (structName(declared) && structName(inferred)) return isSubStruct(inferred, declared);
     const numeric = (t: string) => t === "int" || t === "float" || t === "char" || t === "bool";
     if (numeric(declared) && numeric(inferred)) return true;
@@ -529,6 +564,160 @@ function fits(declared: string, inferred: string): boolean {
         return d.length === i.length && d.every((t, k) => fits(t, i[k]));
     }
     return false;
+}
+
+// sized integers and pointers: a value only goes where it can't lose anything. A smaller integer
+// widens (u8 -> u16 -> int; a signed one only into a wider signed type), int and u64 mix, and
+// anything else (int -> u8, one pointer type -> another, an integer -> a pointer) needs a cast.
+// An integer literal that fits the type is accepted too: see adoptLiteralType
+function fitsLowLevel(declared: string, inferred: string): boolean {
+    if (isPtrType(declared) || isPtrType(inferred)) return declared === inferred;
+    if (declared === "float") return isIntLike(inferred);
+    const info = (t: string) => t === "int" ? { size: 8, signed: true } : t === "char" || t === "bool" ? { size: 1, signed: false } : SIZED_INTS[t];
+    const d = info(declared), i = info(inferred);
+    if (!d || !i) return false;
+    if (d.size === 8 && i.size === 8) return true;
+    if (i.size > d.size) return false;
+    if (i.size === d.size) return d.signed === i.signed;
+    return d.signed || !i.signed;
+}
+
+// extra words for a sized-integer or pointer mismatch: a literal that doesn't fit, or the cast to use
+function lowLevelHint(declared: string | undefined, value: Node): string {
+    if (!declared || !(isSizedInt(declared) || isPtrType(declared))) return "";
+    const lit = literalValue(value);
+    if (lit !== undefined && isSizedInt(declared)) {
+        const [lo, hi] = intRange(declared);
+        return ` (${lit} doesn't fit: a ${declared} holds ${lo} to ${hi})`;
+    }
+    return ` (use ${declared}(...) to convert)`;
+}
+
+// the range of values a sized integer type holds
+function intRange(t: string): [bigint, bigint] {
+    const { size, signed } = SIZED_INTS[t];
+    const bits = BigInt(size * 8);
+    return signed ? [-(1n << (bits - 1n)), (1n << (bits - 1n)) - 1n] : [0n, (1n << bits) - 1n];
+}
+
+// the value of an integer literal (5, -5, 'A'), or undefined
+function literalValue(n: Node): bigint | undefined {
+    if (n.type === "Number" && /^-?\d+$/.test(n.value ?? "") && n.varType !== "float") return BigInt(n.value!);
+    if (n.type === "Char") return BigInt(n.value!.charCodeAt(0));
+    if (n.type === "Unary" && n.value === "-" && n.children[0].type === "Number" && /^\d+$/.test(n.children[0].value ?? "")) return -BigInt(n.children[0].value!);
+    return undefined;
+}
+
+// a type that raw memory can hold: ptr<T> needs a T with a size (not a string, array or float)
+function checkLowLevelType(t: string | undefined, at: Node) {
+    if (!t) return;
+    if (t.endsWith("[]")) return checkLowLevelType(t.slice(0, -2), at);
+    if (!isPtrType(t)) return;
+    const elem = ptrElem(t)!;
+    let size: number | undefined;
+    try { size = sizeOfType(elem); } catch (e: any) { err(at, e.message); }
+    if (size === undefined) {
+        err(at, /^[A-Z]/.test(elem) && !isPackedStruct(elem)
+            ? `${t}: ${elem} isn't a packed struct (a pointer can only point at a packed struct, not a regular one)`
+            : `${t}: a pointer can point at a sized integer, int, char, bool, another pointer or a packed struct, not ${elem}`);
+    }
+}
+
+// where p[i], p.f, p[i].f and p[i].inner.f live in raw memory: the pointer, the element index,
+// the element size, the byte offset inside the element and the type found there. undefined when
+// the expression isn't reached through a pointer
+type Place = { base: Node, index: Node, scale: number, offset: number, type: string };
+function place(n: Node, scope: Scope): Place | undefined {
+    const at = { line: n.line, col: n.col };
+    const element = (base: Node, index: Node, ptrType: string): Place => {
+        checkLowLevelType(ptrType, n);
+        const elem = ptrElem(ptrType)!;
+        return { base, index, scale: sizeOfType(elem)!, offset: 0, type: elem };
+    };
+    if (n.type === "ArrayAccess") {
+        const sym = resolve(n.value!, scope);
+        if (sym && isPtrType(sym.type)) return element({ type: "Identifier", value: n.value, children: [], ...at }, n.children[0], sym.type!);
+        return undefined;
+    }
+    if (n.type === "IndexExpr") {
+        const t = inferType(n.children[0], scope);
+        return isPtrType(t) ? element(n.children[0], n.children[1], t) : undefined;
+    }
+    if (n.type === "FieldAccess") {
+        let p = place(n.children[0], scope);
+        if (!p) {
+            // p.f on a pointer to a packed struct is p[0].f
+            const t = n.children[0].type === "This" ? undefined : inferType(n.children[0], scope);
+            if (!isPtrType(t)) return undefined;
+            p = element(n.children[0], { type: "Number", value: "0", children: [], ...at }, t!);
+        }
+        if (!isPackedStruct(p.type)) err(n, `${p.type} has no fields ('.${n.value}' needs a pointer to a packed struct)`);
+        const field = packedLayout(p.type).fields.find(f => f.name === n.value);
+        if (!field) err(n, `Unknown field '${n.value}' on packed struct '${p.type}'`);
+        return { ...p, offset: p.offset + field.offset, type: field.type };
+    }
+    return undefined;
+}
+
+// checks the pointer and index of a place (each is validated once, here)
+function validatePlace(p: Place, scope: Scope) {
+    validate(p.base, scope);
+    validate(p.index, scope);
+    const it = inferType(p.index, scope);
+    if (it !== "unknown" && !isIntLike(it)) err(p.index, `A pointer index must be a whole number, not ${it}`);
+}
+
+// turns node into a read of raw memory at p
+function toPtrLoad(node: Node, p: Place) {
+    if (isPackedStruct(p.type)) {
+        err(node, `A whole ${p.type} can't be read as a value: read one of its fields, or use addr(...) for its address`);
+    }
+    const line = node.line, col = node.col;
+    for (const k of Object.keys(node)) delete (node as any)[k];
+    Object.assign(node, { type: "PtrLoad", children: [p.base, p.index], varType: p.type, ptr: { scale: p.scale, offset: p.offset }, line, col });
+}
+
+// a store into raw memory: value must fit the type there (a literal that fits is fine)
+function toPtrStore(node: Node, p: Place, value: Node, scope: Scope) {
+    if (isPackedStruct(p.type)) err(node, `A whole ${p.type} can't be assigned: assign its fields one at a time`);
+    if (value.type === "None") err(value, `none can only be stored in a struct field or compared with == / !=`);
+    validatePlace(p, scope);
+    validate(value, scope);
+    adoptLiteralType(value, p.type);
+    wrapCompound(value, p.type);
+    const got = inferType(value, scope);
+    if (!fits(p.type, got)) err(value, `Can't store ${got} where ${p.type} is expected${isSizedInt(p.type) ? ` (use ${p.type}(...) to convert)` : ""}`);
+    const line = node.line, col = node.col;
+    for (const k of Object.keys(node)) delete (node as any)[k];
+    Object.assign(node, { type: "PtrStore", children: [p.base, p.index, value], varType: p.type, ptr: { scale: p.scale, offset: p.offset }, line, col });
+}
+
+// addr(x) is the built-in unless the program defines its own addr
+function isAddrBuiltin(scope: Scope): boolean {
+    const sym = resolve("addr", programScope ?? scope);
+    return !(sym && sym.kind === "func");
+}
+
+// addr(f) for a function, addr(G) for a global, addr(p[i]) / addr(p.f) for something in raw memory
+function validateAddr(node: Node, scope: Scope) {
+    if (node.children.length !== 1) err(node, `addr() takes one argument`);
+    const arg = node.children[0];
+    const line = node.line, col = node.col;
+    const become = (fields: Partial<Node>) => {
+        for (const k of Object.keys(node)) delete (node as any)[k];
+        Object.assign(node, { type: "AddrOf", children: [], line, col, ...fields });
+    };
+    if (arg.type === "Identifier") {
+        const sym = resolve(arg.value!, scope);
+        if (!sym) err(arg, `Undefined identifier: ${arg.value}`);
+        if (sym.kind === "func") return become({ value: arg.value, varType: "function" });
+        if (programScope?.symbols.get(arg.value!) === sym) return become({ value: arg.value, varType: "global" });
+        err(arg, `addr(${arg.value}): ${arg.value} is a local variable, which lives on the stack; only functions, globals and memory reached through a pointer have a lasting address`);
+    }
+    const pl = place(arg, scope);
+    if (!pl) err(arg, `addr() takes a function, a global, or something reached through a pointer (p[i], p.field)`);
+    validatePlace(pl, scope);
+    become({ children: [pl.base, pl.index], ptr: { scale: pl.scale, offset: pl.offset }, varType: "place" });
 }
 
 // the struct a value is an instance of, if it is one
@@ -557,13 +746,24 @@ function fieldOf(obj: Node, fieldName: string, scope: Scope, at: Node): StructFi
 function inferType(node: Node, scope: Scope): Ltype {
     switch (node.type) {
         case "Number":
+            if (isSizedInt(node.varType) || isPtrType(node.varType)) return node.varType!;
             return node.varType === "float" ? "float" : node.varType === "bool" ? "bool" : "int";
 
         case "String":
             return "string";
 
         case "Char":
-            return "char";
+            return isSizedInt(node.varType) ? node.varType! : "char";
+
+        case "Cast":
+        case "PtrLoad":
+            return node.varType!;
+
+        case "SizeOf":
+            return "int";
+
+        case "AddrOf":
+            return "u64";
 
         case "None":
             return "none";
@@ -600,6 +800,7 @@ function inferType(node: Node, scope: Scope): Ltype {
         case "ArrayAccess": {
             const sym = resolve(node.value!, scope);
             if (!sym) err(node, `Undefined identifier: ${node.value}`);
+            if (isPtrType(sym.type)) return place(node, scope)!.type;
             if (sym.type === "string") return "char";
             if (isMapType(sym.type)) return elemOf(sym.type)!;
             return elemOf(sym.type) ?? "int";
@@ -612,6 +813,7 @@ function inferType(node: Node, scope: Scope): Ltype {
 
         case "IndexExpr": {
             const base = inferType(node.children[0], scope);
+            if (isPtrType(base)) return place(node, scope)!.type;
             if (base === "string") return "char";
             return elemOf(base) ?? "unknown";
         }
@@ -635,6 +837,8 @@ function inferType(node: Node, scope: Scope): Ltype {
             return resolve("this", scope)?.structType ?? "unknown";
 
         case "FieldAccess": {
+            const p = place(node, scope);
+            if (p) return p.type;
             const s = structOf(node.children[0], scope);
             const field = s ? lookupStruct(s)?.fields.find(f => f.name === node.value) : undefined;
             return field?.type ?? "unknown";
@@ -655,8 +859,12 @@ function inferType(node: Node, scope: Scope): Ltype {
             return parts[i];
         }
 
-        case "Unary":
-            return inferType(node.children[0], scope);
+        case "Unary": {
+            // -x and ~x work at full width, like the binary operators
+            const t = inferType(node.children[0], scope);
+            if (node.value === "-" && node.varType && isSizedInt(node.varType)) return node.varType;   // an adopted literal
+            return (node.value === "-" || node.value === "~") && isSmallInt(t) ? "int" : t;
+        }
 
         case "Binary":
             return binaryType(node, scope);
@@ -678,6 +886,7 @@ function inferType(node: Node, scope: Scope): Ltype {
                 const s = obj === "this" ? resolve("this", scope)?.structType : (resolve(obj, scope)?.structType ?? structName(recv));
                 return (s && lookupStruct(s)?.methods.get(method)?.returnType) || "unknown";
             }
+            if (node.value === "addr" && isAddrBuiltin(scope)) return "u64";
             const sym = resolveCallee(node.value!, scope);
             const fnType = sym && sym.kind !== "func" ? fnTypeParts(String(sym.type ?? "")) : undefined;
             if (fnType) return fnType.ret;
@@ -694,12 +903,39 @@ function inferType(node: Node, scope: Scope): Ltype {
 // an empty literal ({} or []) takes its type from where it goes
 function adoptLiteralType(value: Node, t: Ltype | undefined) {
     if (!t) return;
+    // an integer literal that fits a sized integer takes its type (var u8 a = 0x0F;), and a
+    // non-negative one can be a pointer's address (var ptr<u16> vga = 0xB8000;)
+    const lit = literalValue(value);
+    if (lit !== undefined && (isSizedInt(t) || isPtrType(t))) {
+        const [lo, hi] = isSizedInt(t) ? intRange(t) : [0n, (1n << 64n) - 1n];
+        if (lit >= lo && lit <= hi) {
+            value.varType = t;
+            if (value.type === "Unary") value.children[0].varType = t;
+        }
+        return;
+    }
+    // var u8[] bytes = [1, 2, 3];
+    if (value.type === "ArrayLiteral" && t.endsWith("[]") && isSizedInt(t.slice(0, -2)) && value.children.length) {
+        value.children.forEach(c => adoptLiteralType(c, t.slice(0, -2)));
+        if (value.children.every(c => c.varType === t.slice(0, -2) || (c.type !== "Number" && c.type !== "Char" && c.type !== "Unary"))) value.varType = t;
+        return;
+    }
     if (value.type === "MapLiteral" && isMapType(t) && (value.children.length === 0 || !value.varType)) value.varType = t;
     if (value.type === "ArrayLiteral" && t.endsWith("[]") && value.children.length === 0) value.varType = t;
 }
 
+// p.f += v was parsed as p.f = p.f + v; into a sized slot it wraps like a compound assignment on a
+// variable, so the result is cut to size
+function wrapCompound(value: Node, slotType: string | undefined) {
+    if (!value.compound || !isSmallInt(slotType)) return;
+    const inner: Node = { ...value, compound: false };
+    for (const k of Object.keys(value)) delete (value as any)[k];
+    Object.assign(value, { type: "Cast", varType: slotType, children: [inner], line: inner.line, col: inner.col });
+}
+
 function assignIntoContainer(slotType: Ltype | undefined, base: Node, value: Node, scope: Scope, node: Node) {
     adoptLiteralType(value, slotType);
+    wrapCompound(value, slotType);
     if (value.type === "None") {
         if (slotType && slotType !== "unknown" && (isScalar(slotType) && slotType !== "string")) err(value, `${/^[aeiou]/.test(slotType) ? "An" : "A"} ${slotType} field can't be none (only string, array and struct fields can)`);
         const b = baseVariable(base);
@@ -710,7 +946,7 @@ function assignIntoContainer(slotType: Ltype | undefined, base: Node, value: Nod
     const numeric = (t: Ltype | undefined) => t === "int" || t === "float" || t === "char" || t === "bool";
     if (slotType && slotType !== "unknown" && valueType !== "unknown" && slotType !== valueType &&
         !(numeric(slotType) && numeric(valueType)) && !fits(String(slotType), valueType)) {
-        err(node, `Type mismatch: can't store ${valueType} where ${slotType} is expected`);
+        err(node, `Type mismatch: can't store ${valueType} where ${slotType} is expected${lowLevelHint(slotType, value)}`);
     }
     markMoved(value, scope);
     if (!isScalar(slotType)) {
@@ -822,6 +1058,7 @@ function resolveCallee(name: string, scope: Scope): SymbolEntry | null {
 // functions; parameters need types; a function returning an array/struct must always return a new
 // one (the caller of the value owns what it returns)
 function functionValueType(name: string, at: Node): Ltype {
+    if (interruptFns.has(name)) err(at, `${name} is an interrupt fn: use addr(${name}) for its address (for the IDT); it can't be called or stored as a function value`);
     const params = paramTypes.get(name);
     const userFn = params !== undefined && !(name in BUILTIN_PARAMS);
     if (!userFn) err(at, `${name} is a built-in and can't be used as a value`);
@@ -928,6 +1165,8 @@ export function validate(node: Node, scope: Scope) {
         }
 
         case "FieldAccess": {
+            const pl = place(node, scope);
+            if (pl) { validatePlace(pl, scope); toPtrLoad(node, pl); break; }
             const obj = node.children[0]
             validate(obj, scope)
             fieldOf(obj, node.value!, scope, node)
@@ -935,6 +1174,9 @@ export function validate(node: Node, scope: Scope) {
         }
 
         case "FieldAssign": {
+            const target: Node = { type: "FieldAccess", value: node.value, children: [node.children[0]], line: node.line, col: node.col };
+            const pl = place(target, scope);
+            if (pl) { toPtrStore(node, pl, node.children[1], scope); break; }
             const obj = node.children[0]
             validate(obj, scope)
             const field = fieldOf(obj, node.value!, scope, node)
@@ -962,7 +1204,8 @@ export function validate(node: Node, scope: Scope) {
             heapGlobalNames = findHeapGlobalNames(node);
             reassigns = findGlobalReassigns(node);
             mutates = findParamMutations(node);
-            paramTypes = new Map(node.children.filter(c => c.type === "Function")
+            interruptFns = new Set(node.children.filter(c => c.type === "Function" && c.interrupt).map(c => c.value!));
+            paramTypes = new Map(node.children.filter(c => c.type === "Function" || c.type === "ExternFn")
                 .map(f => [f.value!, f.children.filter(c => c.type === "Identifier").map(c => c.varType)]));
             for (const [name, types] of Object.entries(BUILTIN_PARAMS)) if (!paramTypes.has(name)) paramTypes.set(name, types);
             methodParamTypes = new Map();
@@ -977,6 +1220,17 @@ export function validate(node: Node, scope: Scope) {
             break;
 
         case "Function": {
+            if (node.interrupt) {
+                // the stub the compiler generates passes the frame and, for exceptions that push one, the error code
+                const ps = node.children.filter(c => c.type === "Identifier");
+                const want = ["ptr<InterruptFrame>", "u64"];
+                if (ps.length > 2 || ps.some((p, i) => p.varType !== want[i])) {
+                    err(node, `interrupt fn ${node.value} takes (ptr<InterruptFrame> frame) and, for an exception with an error code, (ptr<InterruptFrame> frame, u64 error_code)`);
+                }
+                if (node.value === "main" || node.value === "kernel_main") err(node, `${node.value} can't be an interrupt fn`);
+            }
+            for (const c of node.children) if (c.type === "Identifier") checkLowLevelType(c.varType, node);
+            checkLowLevelType(node.varType, node);
             currentReturnType = node.varType
             moved = new Set()  // reset for each function
             borrows = new Map()
@@ -1006,8 +1260,10 @@ export function validate(node: Node, scope: Scope) {
         }
 
         case "VarDecl": {
+            checkLowLevelType(node.varType, node);
             validate(node.children[0], scope);
             const init = node.children[0];
+            adoptLiteralType(init, node.varType);
             // a float[] declared from a literal of ints: IR.ts converts the elements
             if (node.varType === "float[]" && init.type === "ArrayLiteral" && inferType(init, scope) === "int[]") {
                 init.varType = "float[]";
@@ -1029,7 +1285,7 @@ export function validate(node: Node, scope: Scope) {
                 (declared === "char" && inferred === "int");
             if (node.varType && node.varType !== inferredType && inferredType !== "unknown"
                 && !compatible(node.varType, inferredType) && !fits(node.varType, inferredType)) {
-                err(node, `Type annotation mismatch: declared ${node.varType}, inferred ${inferredType}`);
+                err(node, `Type annotation mismatch: declared ${node.varType}, inferred ${inferredType}${lowLevelHint(node.varType, init)}`);
             }
             const finalType = node.varType ?? inferredType;
             let arraySize: number | undefined;
@@ -1071,9 +1327,59 @@ export function validate(node: Node, scope: Scope) {
             break;
         }
 
-        case "Unary":
+        case "Unary": {
             validate(node.children[0], scope);
+            const t = inferType(node.children[0], scope);
+            if (node.value === "~" && t !== "unknown" && !isIntLike(t)) err(node, `'~' needs a whole number, not ${t}`);
+            if (node.value === "~" && t === "u64") node.unsigned = true;
             break;
+        }
+
+        case "Cast": {
+            validate(node.children[0], scope);
+            const to = String(node.varType), from = inferType(node.children[0], scope);
+            checkLowLevelType(to, node);
+            // a string's characters can be read through a byte pointer: ptr<u8>("text")
+            const stringBytes = from === "string" && ["ptr<u8>", "ptr<i8>", "ptr<char>"].includes(to);
+            const ok = from === "unknown" || isIntLike(from) || isPtrType(from) || (from === "float" && !isPtrType(to)) || stringBytes;
+            if (!ok) err(node, `Can't convert ${from} to ${to}`);
+            break;
+        }
+
+        case "SizeOf": {
+            let size: number | undefined;
+            try { size = sizeOfType(String(node.varType)); } catch (e: any) { err(node, e.message); }
+            if (size === undefined) err(node, `sizeof(${node.varType}): only sized integers, int, char, bool, pointers and packed structs have a size`);
+            const line = node.line, col = node.col;
+            for (const k of Object.keys(node)) delete (node as any)[k];
+            Object.assign(node, { type: "Number", value: String(size), children: [], line, col });
+            break;
+        }
+
+        // made from other nodes on an earlier pass (loop bodies are checked twice)
+        case "PtrLoad":
+        case "PtrStore":
+        case "AddrOf":
+            node.children.forEach(c => validate(c, scope));
+            break;
+
+        case "PackedStructDef":
+            try { packedLayout(node.value!); } catch (e: any) { err(node, e.message); }
+            for (const f of node.children) checkLowLevelType(f.varType, f);
+            break;
+
+        case "ExternFn": {
+            // only values that are plain numbers or addresses cross into assembly/C
+            const lowLevel = (t: string | undefined) => !t || t === "void" || isIntLike(t) || isPtrType(t) || t === "float";
+            for (const p of node.children) {
+                if (!p.varType) err(node, `Parameter ${p.value} of extern fn ${node.value} needs a type`);
+                if (!lowLevel(p.varType)) err(node, `Parameter ${p.value} of extern fn ${node.value} can't be ${p.varType}: extern functions take whole numbers, floats and pointers`);
+                checkLowLevelType(p.varType, node);
+            }
+            if (!lowLevel(node.varType)) err(node, `extern fn ${node.value} can't return ${node.varType}: extern functions return whole numbers, floats and pointers`);
+            checkLowLevelType(node.varType, node);
+            break;
+        }
 
         case "Return": {
             const value = node.children[0];
@@ -1081,7 +1387,7 @@ export function validate(node: Node, scope: Scope) {
             if (currentReturnType) {
                 adoptLiteralType(value, currentReturnType);
                 const got = inferType(value, scope);
-                if (!fits(String(currentReturnType), got)) err(value, `This function returns ${currentReturnType}, not ${got}`);
+                if (!fits(String(currentReturnType), got)) err(value, `This function returns ${currentReturnType}, not ${got}${lowLevelHint(currentReturnType, value)}`);
             }
             const roots = rootsBehind(value, scope);
             if ([...roots].some(isGlobal)) {
@@ -1099,6 +1405,7 @@ export function validate(node: Node, scope: Scope) {
         }
 
         case "Call": {
+            if (node.value === "addr" && isAddrBuiltin(scope)) { validateAddr(node, scope); break; }
             if(node.value!.includes(".")) {
                 const [objName, methodName] = node.value!.split(".")
                 const receiver: Node = objName === "this" ? { type: "This", children: [] } : { type: "Identifier", value: objName, children: [], line: node.line, col: node.col }
@@ -1137,6 +1444,9 @@ export function validate(node: Node, scope: Scope) {
             }
             if (!sym || sym.kind !== "func") {
                 err(node, `Undefined function: ${node.value}`);
+            }
+            if (interruptFns.has(node.value!)) {
+                err(node, `${node.value} is an interrupt fn: the CPU calls it (put addr(${node.value}) in the IDT), L code can't`);
             }
             if (sym.params !== undefined && node.children.length !== sym.params) {
                 err(node, `Function ${node.value} expects ${sym.params} args, got ${node.children.length}`);
@@ -1207,6 +1517,7 @@ export function validate(node: Node, scope: Scope) {
             if (assigned.type === "MapLiteral" && isMapType(sym.type) && assigned.children.length === 0) assigned.varType = sym.type;
             if (sym.type?.endsWith("[]") && assigned.type === "ArrayLiteral" && assigned.children.length === 0) assigned.varType = sym.type;
             validate(node.children[0], scope);
+            adoptLiteralType(assigned, sym.type);
             moved.delete(sym);  // assignment gives the variable a new value, so it is no longer "moved"
             staleReason.delete(sym);
             if (isGlobal(sym)) {
@@ -1229,7 +1540,7 @@ export function validate(node: Node, scope: Scope) {
             // "unknown" on either side (e.g. a variable initialised from a call) is not checked
             if (sym.type && sym.type !== "unknown" && sym.type !== inferredType && inferredType !== "unknown"
                 && !compatibleAssign(sym.type, inferredType) && !fits(sym.type, inferredType)) {
-                err(node, `Type mismatch in assignment to ${node.value}: ${sym.type} vs ${inferredType}`);
+                err(node, `Type mismatch in assignment to ${node.value}: ${sym.type} vs ${inferredType}${lowLevelHint(sym.type, node.children[0])}`);
             }
             break;
         }
@@ -1269,6 +1580,8 @@ export function validate(node: Node, scope: Scope) {
         case "ArrayAccess": {
             const sym = resolve(node.value!, scope);
             if (!sym) err(node, `Undefined variable: ${node.value}`);
+            const pl = place(node, scope);
+            if (pl) { validatePlace(pl, scope); toPtrLoad(node, pl); break; }
             checkNotMoved(sym, node);
             validate(node.children[0], scope);
             if (isMapType(sym.type)) { checkMapKey(mapTypeParts(sym.type)!.key, node.children[0], scope); break; }
@@ -1283,6 +1596,8 @@ export function validate(node: Node, scope: Scope) {
         }
 
         case "IndexExpr": {
+            const pl = place(node, scope);
+            if (pl) { validatePlace(pl, scope); toPtrLoad(node, pl); break; }
             validate(node.children[0], scope);
             validate(node.children[1], scope);
             const base = inferType(node.children[0], scope);
@@ -1294,6 +1609,8 @@ export function validate(node: Node, scope: Scope) {
         case "ArrayAssign": {
             const sym = resolve(node.value!, scope);
             if (!sym) err(node, `Undefined variable: ${node.value}`);
+            const pl = place({ type: "ArrayAccess", value: node.value, children: [node.children[0]], line: node.line, col: node.col }, scope);
+            if (pl) { toPtrStore(node, pl, node.children[1], scope); break; }
             checkNotMoved(sym, node);
             if (sym.type === "string") err(node, `Strings can't be changed in place; build a new string instead`);
             validate(node.children[0], scope); // index
@@ -1304,6 +1621,8 @@ export function validate(node: Node, scope: Scope) {
         }
 
         case "IndexAssign": {
+            const pl = place({ type: "IndexExpr", children: [node.children[0], node.children[1]], line: node.line, col: node.col }, scope);
+            if (pl) { toPtrStore(node, pl, node.children[2], scope); break; }
             validate(node.children[0], scope);
             validate(node.children[1], scope);
             validate(node.children[2], scope);
@@ -1392,7 +1711,15 @@ export function validate(node: Node, scope: Scope) {
             checkConst(sym, node);
             checkNotMoved(sym, lhs);
             validate(node.children[1], scope);
-            binaryType({ type: "Binary", value: node.value!.slice(0, -1), children: [lhs, node.children[1]], line: node.line, col: node.col }, scope);
+            const bin: Node = { type: "Binary", value: node.value!.slice(0, -1), children: [lhs, node.children[1]], line: node.line, col: node.col };
+            binaryType(bin, scope);
+            node.unsigned = bin.unsigned;
+            // a sized variable keeps its type: the result wraps (count += 1 on a u8 255 gives 0)
+            if (isSmallInt(sym.type)) {
+                if (inferType(node.children[1], scope) === "float") err(node, `Can't ${node.value} a float into ${sym.type} ${lhs.value}; convert it with ${sym.type}(...)`);
+                node.truncTo = sym.type;
+            }
+            if (isPtrType(sym.type)) node.ptr = bin.ptr;
             break;
         }
 
@@ -1401,6 +1728,8 @@ export function validate(node: Node, scope: Scope) {
             const sym = resolve(node.value!, scope);
             if (!sym) err(node, `Undefined variable: ${node.value}`);
             checkConst(sym, node);
+            if (isSmallInt(sym.type)) node.truncTo = sym.type;
+            if (isPtrType(sym.type)) { checkLowLevelType(sym.type, node); node.ptr = { scale: sizeOfType(ptrElem(sym.type)!)!, offset: 0 }; }
             break;
         }
 

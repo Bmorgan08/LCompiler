@@ -27,6 +27,33 @@ static long syscall6(long n, long a, long b, long c, long d, long e, long f)
 int main(void);
 void exit(int code);
 
+#ifdef L_KERNEL
+// ── Kernel mode (built with -DL_KERNEL for `--kernel`) ──
+// There is no OS to make system calls to: the kernel written in L provides these hooks instead.
+// Each has a weak default here, so a kernel that leaves some out still links.
+typedef unsigned long u64;
+size_t strlen(const char *s);
+
+__attribute__((noreturn)) static void halt_forever(void)
+{
+    for (;;)
+        __asm__ volatile("cli; hlt");
+}
+
+__attribute__((weak)) void kernel_write(const char *text, u64 len) { (void)text; (void)len; }
+__attribute__((weak)) void kernel_panic(const char *msg, u64 len) { (void)msg; (void)len; }
+__attribute__((weak)) u64 kernel_read(char *buf, u64 max) { (void)buf; (void)max; return 0; }
+__attribute__((weak)) u64 kernel_alloc_pages(u64 count)
+{
+    static const char msg[] = "L runtime: out of memory (the kernel has no kernel_alloc_pages)";
+    (void)count;
+    kernel_panic(msg, sizeof msg - 1);
+    halt_forever();
+}
+
+// stops the kernel with a message: kernel_panic gets it, and if kernel_panic returns the CPU halts
+__attribute__((noreturn)) static void kernel_stop(const char *msg, u64 len);
+#else
 __attribute__((naked, noreturn)) void _start(void)
 {
     __asm__ volatile(
@@ -36,12 +63,19 @@ __attribute__((naked, noreturn)) void _start(void)
         "mov %eax, %edi\n"
         "call exit\n");
 };
+#endif
 
 static char outbuf[4096];
 static size_t outlen;
 
 static void write_all(int fd, const char *p, size_t n)
 {
+#ifdef L_KERNEL
+    (void)fd;
+    if (n > 0)
+        kernel_write(p, n);
+    return;
+#endif
     while (n > 0)
     {
         long w = syscall3(1, fd, (long)p, (long)n);
@@ -68,8 +102,15 @@ static void out_char(char c)
 void exit(int code)
 {
     flush_stdout();
+#ifdef L_KERNEL
+    // nothing to exit to: something that would end a program stops the kernel
+    (void)code;
+    static const char msg[] = "L runtime: exit() called";
+    kernel_stop(msg, sizeof msg - 1);
+#else
     syscall3(231, code, 0, 0);
     __builtin_unreachable();
+#endif
 }
 
 static char stdin_tag, stderr_tag;
@@ -185,6 +226,9 @@ static size_t arena_left;
 
 static void *os_alloc(size_t n)
 {
+#ifdef L_KERNEL
+    return (void *)kernel_alloc_pages((n + 4095) / 4096);
+#endif
     long p = syscall6(9, 0, (long)n, 3, 0x22, -1, 0);
     return (p < 0 && p > -4096) ? NULL : (void *)p;
 }
@@ -277,6 +321,9 @@ int fputs(const char *s, void *stream)
     if (stream == stderr)
     {
         flush_stdout();
+#ifdef L_KERNEL
+        kernel_stop(s, strlen(s));   // only runtime errors are written to stderr
+#endif
         write_all(2, s, strlen(s));
     }
     else
@@ -461,6 +508,9 @@ int printf(const char *f, ...)
     va_start(ap, f);
     format(emit_stdout, NULL, f, ap);
     va_end(ap);
+#ifdef L_KERNEL
+    flush_stdout();   // each print() reaches kernel_write straight away
+#endif
     return 0;
 }
 
@@ -489,7 +539,11 @@ static int in_getc(void)
     if (inpos == inlen)
     {
         flush_stdout();
+#ifdef L_KERNEL
+        long r = (long)kernel_read(inbuf, sizeof inbuf);
+#else
         long r = syscall3(0, 0, (long)inbuf, sizeof inbuf);
+#endif
         if (r <= 0)
             return -1;
         inpos = 0;
@@ -575,3 +629,18 @@ long atoi(const char *s)
         v = v * 10 + (unsigned long)(*s++ - '0');
     return (long)(neg ? 0 - v : v);
 }
+
+#ifdef L_KERNEL
+static void kernel_stop(const char *msg, u64 len)
+{
+    flush_stdout();
+    kernel_panic(msg, len);
+    halt_forever();
+}
+
+// a runtime error in compiled code (index out of bounds, division by zero, a field never set)
+__attribute__((noreturn)) void lrt_kernel_fail(const char *msg, u64 len)
+{
+    kernel_stop(msg, len);
+}
+#endif

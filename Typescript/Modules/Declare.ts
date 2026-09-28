@@ -1,4 +1,8 @@
-import { Scope, define, createScope, registerStruct, lookupStruct, StructDef, StructField } from "./Scope";
+import { Scope, define, createScope, registerStruct, lookupStruct, StructDef, StructField, registerPacked } from "./Scope";
+
+// what the CPU pushes when it takes an interrupt in 64-bit mode (after the error code, if any);
+// an interrupt fn's frame parameter points at it. A program can declare its own InterruptFrame
+const INTERRUPT_FRAME = ["rip", "cs", "rflags", "rsp", "ss"].map(name => ({ name, type: "u64" }));
 import { Node } from "./Parser";
 
 export function declare(node: Node, scope: Scope) {
@@ -54,6 +58,20 @@ export function declare(node: Node, scope: Scope) {
             break
         }
 
+        case "PackedStructDef":
+            registerPacked(node.value!, node.children.map(f => ({ name: f.value!, type: String(f.varType) })));
+            define(scope, { name: node.value!, kind: "struct" });
+            break;
+
+        case "ExternFn":
+            define(scope, {
+                name: node.value!,
+                kind: "func",
+                params: node.children.length,
+                type: node.varType
+            });
+            break;
+
         case "StructField":
             break;
         case "StructMethod":
@@ -70,6 +88,9 @@ export function declare(node: Node, scope: Scope) {
             break;
 
         case "Program":
+            if (!node.children.some(c => c.type === "PackedStructDef" && c.value === "InterruptFrame")) {
+                registerPacked("InterruptFrame", INTERRUPT_FRAME);
+            }
             node.children.forEach(c => declare(c, scope));
             break;
 

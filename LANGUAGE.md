@@ -21,14 +21,15 @@ L is a compiled, statically-typed language that produces native Linux binaries. 
 13. [Structs](#structs)
 14. [Imports](#imports)
 15. [Inline Assembly](#inline-assembly)
-16. [Built-ins](#built-ins)
-17. [Standard Library](#standard-library)
+16. [Low-Level Programming](#low-level-programming)
+17. [Built-ins](#built-ins)
+18. [Standard Library](#standard-library)
     - [math](#math)
     - [graphics](#graphics)
     - [string](#string)
-18. [Runtime Errors](#runtime-errors)
-19. [Full Example](#full-example)
-20. [Nerd Talk](#nerd-talk)
+19. [Runtime Errors](#runtime-errors)
+20. [Full Example](#full-example)
+21. [Nerd Talk](#nerd-talk)
 
 ---
 
@@ -52,6 +53,7 @@ node dist/Main.js hello.l hello    # compiles to ./hello
 | `--verbose` | Print all of the above                 |
 | `--check`   | Only check the program: report its errors and exit 1, or exit 0; no files are written |
 | `--nolibc`  | Link without the C library (see [Without the C Library](#without-the-c-library)) |
+| `--kernel`  | Compile an operating system kernel to an object file (see [Writing a Kernel](#writing-a-kernel)) |
 
 Errors include the source location: `line:col: message`. Every type and memory-safety error in the program is reported, one per line; a syntax error stops the compiler at the first one, since the code after it can't be read reliably. The VS Code extension runs `--check` whenever a file is opened or saved and shows the errors in the editor.
 
@@ -111,6 +113,9 @@ main() {
 | `int[][]`, `float[][]` | 2-D array of numbers              |
 | `map<K, V>` | Keys of type `K` mapped to values of type `V` (see [Maps](#maps)) |
 | `fn(A, B): R` | A function taking `A` and `B` and returning `R` (see [Functions as Values](#functions-as-values)) |
+| `u8` `u16` `u32` `u64` | Unsigned integers of 8, 16, 32 and 64 bits (see [Low-Level Programming](#low-level-programming)) |
+| `i8` `i16` `i32` | Signed integers of 8, 16 and 32 bits (`int` is the signed 64-bit one) |
+| `ptr<T>`   | The address of a `T` in raw memory (see [Pointers](#pointers)) |
 
 Struct types are named with a capital letter by convention (`Point`, `Player`, `Node`). A tuple's type is written as its element types in parentheses, e.g. `(string, int)` (see [Tuples](#tuples)).
 
@@ -195,10 +200,19 @@ x + y    x - y    x * y    x / y    x % y
 
 Integer `/` and `%` round toward zero (`-7 / 2` is `-3`, `-7 % 3` is `-1`). Dividing an integer by zero stops the program with `Error: division by zero` (see [Runtime Errors](#runtime-errors)). Float division by zero follows IEEE 754 and gives `inf` or `nan`.
 
+### Bitwise
+
+```
+x & y    x | y    x ^ y    ~x    x << n    x >> n
+```
+
+These work on whole numbers (`int`, `char`, `bool` and the sized integers). `>>` keeps the sign of a signed value (`-8 >> 1` is `-4`) and fills with zeros for `u64`.
+
 ### Compound Assignment
 
 ```
 x += y    x -= y    x *= y    x /= y    x %= y
+x &= y    x |= y    x ^= y    x <<= n   x >>= n
 ```
 
 ### Increment / Decrement
@@ -228,7 +242,12 @@ x && y    x || y    !x
 ```
 -x     // negation
 !x     // logical NOT
+~x     // bitwise NOT
 ```
+
+### Precedence
+
+From loosest to tightest, the same as C: `||`, `&&`, `|`, `^`, `&`, `==` `!=`, `<` `<=` `>` `>=`, `<<` `>>`, `+` `-`, `*` `/` `%`. So `a + b << 3` is `(a + b) << 3`, and `flags & MASK == 0` is `flags & (MASK == 0)`: write the parentheses.
 
 ---
 
@@ -825,6 +844,197 @@ This is mainly useful for things the language can't express yet, or for micro-op
 
 ---
 
+## Low-Level Programming
+
+These features are for code that talks to hardware directly, such as an operating system kernel: sized integers, pointers into raw memory, structs with an exact memory layout, port I/O, and calling functions written in assembly or C.
+
+### Sized Integers
+
+| Type  | Size    | Range |
+|-------|---------|-------|
+| `u8`  | 1 byte  | 0 to 255 |
+| `u16` | 2 bytes | 0 to 65,535 |
+| `u32` | 4 bytes | 0 to 4,294,967,295 |
+| `u64` | 8 bytes | 0 to 2⁶⁴ − 1 |
+| `i8`  | 1 byte  | −128 to 127 |
+| `i16` | 2 bytes | −32,768 to 32,767 |
+| `i32` | 4 bytes | −2³¹ to 2³¹ − 1 |
+| `int` | 8 bytes | −2⁶³ to 2⁶³ − 1 |
+
+```
+var u8 attr = 0x0F;           // a literal that fits is fine
+var u16 cell = u16((attr << 8) | 'A');
+var i8 delta = -3;
+```
+
+- **Nothing is lost without you asking.** A value only goes where it fits: a `u8` goes into a `u16`, an `int` or an `i16`; an `i8` into an `i16` or `int`; `int` and `u64` mix. Anything narrower, or signed into unsigned, is a compile error until you convert it: `var u8 b = u8(x);` keeps the low 8 bits. An integer literal is accepted when it fits (`var u8 b = 300;` is an error that says so).
+- **Arithmetic is done at full width**, like C: `a + b` on two `u8`s is an `int`, so `attr << 8` doesn't lose bits. Storing the result back into a `u8` needs `u8(...)`.
+- **Compound assignment and `++`/`--` wrap**: on a `u8` holding 250, `x += 10` gives 4, and `x++` on 255 gives 0. This also applies to a sized array element, struct field or pointer target (`p.flags |= 0x80;`).
+- **`u64` is unsigned**: comparisons, `/`, `%` and `>>` treat it as 0 to 2⁶⁴ − 1. The smaller unsigned types are always positive, so they compare the same either way.
+- Conversions: `u8(x)` … `i32(x)`, `int(x)`, `u64(x)` convert any whole number, float (truncated) or pointer.
+
+### Pointers
+
+`ptr<T>` is the address of a `T` in raw memory. `T` can be a sized integer, `int`, `char`, `bool`, another pointer or a [packed struct](#packed-structs).
+
+```
+var ptr<u16> vga = 0xB8000;          // an address literal
+vga[0] = 0x0F00 + 'H';               // white-on-black 'H' in the top-left corner
+vga[1] = 0x0F00 + 'i';
+
+var ptr<u16> row = vga + 80 * 2;     // the start of the third row
+row[5] = 0x2F00 + '!';
+```
+
+- `p[i]` reads or writes the `i`th `T` at `p`, exactly `sizeof(T)` bytes. Signed types are sign-extended when read.
+- `p + n` and `p - n` move by `n` elements, not bytes (`ptr<u64>` moves 8 bytes per element); `p++`, `p += n` too.
+- Pointers compare with `==`, `<`, … (as unsigned addresses), with each other or with a literal address (`p == 0`).
+- Conversions: `ptr<T>(x)` turns an integer or another pointer into a `ptr<T>`, and `u64(p)` gives the address as a number. A pointer of one type doesn't go into a variable of another without a conversion. `ptr<u8>(s)` gives a string's bytes (valid while the string is).
+- **L doesn't manage this memory.** There are no bounds checks and nothing is freed: pointers are plain addresses, copied like numbers.
+- **Every read and write happens.** The optimizer never removes or merges an access through a pointer, so a hardware register that changes on its own is read each time.
+
+### Packed Structs
+
+A `packed struct` describes a block of memory field by field, with no padding and no hidden header: exactly the layout hardware tables need.
+
+```
+packed struct IdtEntry {
+    var offset_low: u16;
+    var selector: u16;
+    var ist: u8;
+    var flags: u8;
+    var offset_mid: u16;
+    var offset_high: u32;
+    var zero: u32;
+}
+
+var ptr<IdtEntry> idt = ptr<IdtEntry>(table_base);
+idt[32].selector = 0x08;
+idt[32].flags = 0x8E;
+print(sizeof(IdtEntry));     // 16
+```
+
+- Fields are sized integers, `int`, `char`, `bool`, pointers or other packed structs (laid out inline). They have no defaults.
+- A packed struct is used through a pointer: `p[i].field`, and `p.field` for `p[0].field`. A whole packed struct can't be copied as a value; read or write its fields.
+- Packed structs have no methods and don't extend each other. They're separate from regular structs, which live on the heap and are managed by L.
+
+### addr and sizeof
+
+- `addr(x)` gives the address (as a `u64`) of a function (`addr(on_timer)`), a global variable (`addr(gdt_table)`), or something reached through a pointer (`addr(idt[32])`, `addr(p.flags)`). Local variables live on the stack and have no lasting address, so `addr` of one is an error.
+- `sizeof(T)` is the size in bytes of a sized integer, `int`, `char`, `bool`, a pointer or a packed struct.
+
+### Port I/O
+
+| Function            | Instruction |
+|---------------------|-------------|
+| `outb(port, value)` | `out dx, al` (value is a `u8`) |
+| `outw(port, value)` | `out dx, ax` (value is a `u16`) |
+| `outl(port, value)` | `out dx, eax` (value is a `u32`) |
+| `inb(port)` → `u8`  | `in al, dx` |
+| `inw(port)` → `u16` | `in ax, dx` |
+| `inl(port)` → `u32` | `in eax, dx` |
+
+`port` is a `u16`. These are single instructions, so they need to run in a kernel (ring 0); in a normal program they crash.
+
+```
+outb(0x20, 0x20);          // end of interrupt, to the PIC
+var u8 scancode = inb(0x60);
+```
+
+### extern fn
+
+`extern fn` declares a function written in assembly or C, so L can call it. It has no body, and it's linked in with the rest of your program.
+
+```
+extern fn load_idt(u64 base, u16 limit);
+extern fn read_cr2(): u64;
+extern fn memset(ptr<u8> dest, int value, u64 count): ptr<u8>;
+```
+
+- Parameters and return values are whole numbers, floats or pointers, passed with the standard x86-64 calling convention (System V), the same one L's own functions use. That also means assembly can call L functions directly: every L function is exported under its own name.
+- Arguments are checked like any call. A return type smaller than 64 bits is cut to size, since assembly and C only set the low bits of the register.
+
+### Interrupts
+
+`interrupt fn` declares a handler the CPU calls through the IDT (Interrupt Descriptor Table):
+
+```
+var int ticks = 0;
+
+interrupt fn on_timer(ptr<InterruptFrame> frame) {
+    ticks++;
+    outb(0x20, 0x20);                 // tell the PIC the interrupt is handled
+    return 0;
+}
+
+interrupt fn on_page_fault(ptr<InterruptFrame> frame, u64 error_code) {
+    print("page fault at " + inttostr(int(read_cr2())));
+    return 0;
+}
+
+set_gate(32, addr(on_timer));         // your code: fill in the IDT entry
+set_gate(14, addr(on_page_fault));
+```
+
+- The compiler generates the entry point the CPU jumps to (the address `addr(on_timer)` gives). It saves every register and the SSE state, calls your code, restores them all and returns with `iretq`, so a handler is ordinary L code and can't disturb what it interrupted.
+- `frame` points at what the CPU saved: the built-in packed struct `InterruptFrame` with fields `rip`, `cs`, `rflags`, `rsp` and `ss` (all `u64`). Changing them changes where the CPU goes back to (`frame.rip += 2;` skips a 2-byte instruction).
+- The CPU pushes an error code for some exceptions (8, 10–14, 17, 21, 29, 30; 14 is the page fault). Their handlers take it as a second parameter, `u64 error_code`, and the entry point removes it before returning. For every other vector, leave it out: a mismatch corrupts the stack.
+- A handler can't be called from L or stored as a function value: only the CPU calls it, through `addr(...)` in the IDT.
+- Filling in the IDT, loading it (`lidt`), and turning interrupts on and off (`sti`/`cli`) are up to your kernel: a packed struct for the gates, `asm { sti }`, and a two-line assembly function for `lidt` do it (`Test/KernelTests.js` has a complete example).
+- A handler runs with interrupts off (in an interrupt gate). L's heap isn't safe to use from a handler while the code it interrupted might be using it: keep handlers to numbers, pointers and packed structs, or turn interrupts off around heap use in the rest of the kernel.
+
+### Writing a Kernel
+
+`--kernel` compiles a kernel instead of a program:
+
+```sh
+node dist/Main.js kernel.l build/kernel --kernel
+# -> build/kernel.o          your kernel
+#    build/kernel-runtime.o  L's runtime for it (nolibc.c built with -DL_KERNEL, plus lrt.c)
+nasm -f elf64 boot.asm -o build/boot.o
+ld -n -T linker.ld build/boot.o build/kernel.o build/kernel-runtime.o -o build/kernel.elf
+```
+
+`Test/kernel/boot.asm` and `Test/kernel/linker.ld` are minimal boot code and a linker script that work with this (the kernel tests use them): Multiboot, the switch to 64-bit mode, the first 1 GiB identity-mapped, SSE turned on, then a call to `kernel_main`.
+
+**The entry point is `kernel_main()`.** Your boot code calls it once the CPU is in 64-bit mode with a stack. Globals are set up at the start of `kernel_main`, as they are at the start of `main` in a program. A kernel has no `main`.
+
+A global set to a plain number or address (`var u64 next_page = 0x400000;`) holds its value from the very start: it's stored with it, so the hooks can use such globals even while other globals (arrays, strings) are still being set up.
+
+**Hooks.** L's runtime needs a few things only your kernel can do. Write them as ordinary L functions with these names; any you leave out get the default:
+
+| Hook | Called for | Default |
+|------|------------|---------|
+| `kernel_write(ptr<u8> text, u64 len)` | `print()` and `printchar()`: each call to `print` is one call to `kernel_write` | output is dropped |
+| `kernel_alloc_pages(u64 count): u64` | memory for strings, arrays, maps and structs: return the address of `count` free, contiguous 4 KiB pages, or 0 | panics: "out of memory (the kernel has no kernel_alloc_pages)" |
+| `kernel_panic(ptr<u8> message, u64 len)` | runtime errors (index out of bounds, division by zero, ...): print the message; the CPU halts after it returns | halts |
+| `kernel_read(ptr<u8> buf, u64 max): u64` | `input()` and `inputstr()`: fill `buf` with up to `max` bytes (a line), return how many | no input |
+
+```
+function kernel_write(ptr<u8> text, u64 len) {
+    var u64 i = 0;
+    while (i < len) {
+        serial_write(text[i]);      // and/or the screen
+        i++;
+    }
+    return 0;
+}
+
+var u64 next_page = 0x400000;       // free memory from 4 MiB up
+function kernel_alloc_pages(u64 count): u64 {
+    var u64 start = next_page;
+    next_page += count * 4096;
+    return start;
+}
+```
+
+- The hooks are called from inside the runtime, so they should only use numbers, pointers and packed structs, never strings, arrays or maps (which would call back into the allocator). `ptr<u8>("text")` gives a string literal's bytes, which is fine.
+- Code that runs before your allocator is ready (setting up paging, say) must not create strings, arrays, maps or structs either.
+- Your boot code has to turn on SSE before calling `kernel_main`: L uses it for floats, and the runtime is compiled expecting it. `Test/kernel/boot.asm` shows how.
+- The runtime is compiled without the red zone (so an interrupt can't overwrite a function's locals) and for any load address, so a higher-half kernel works too.
+
+---
+
 ## Built-ins
 
 These functions are always available without any import.
@@ -1247,6 +1457,8 @@ The compiler checks types at compile time. Mismatched types on assignment or fun
 - `int` and `float` implicitly convert to each other on assignment (float to int truncates towards zero)
 - `int` and `bool` are interchangeable — any non-zero integer is truthy
 - Untyped `var` declarations infer their type from the right-hand side
+- Sized integers and pointers are strict: a value only goes where it can't lose anything, and everything else needs a conversion like `u8(x)` or `ptr<u16>(x)` (see [Low-Level Programming](#low-level-programming))
+- Memory reached through a pointer isn't checked: there are no bounds checks on `p[i]`, and L never frees it
 
 ### Integer Overflow
 
