@@ -7,6 +7,7 @@ import { createScope, define } from "./Modules/Scope";
 import { declare } from "./Modules/Declare";
 import { validate, errors } from "./Modules/Validate";
 import { IRGen, printIR } from "./Modules/IR";
+import { renameShadowingLocals } from "./Modules/Shadow";
 import { emitNASM } from "./Modules/Emitter";
 import { copyProp, DCE, fold, cse, insertFrees } from "./Modules/Optimize";
 
@@ -41,24 +42,42 @@ const stdlibDir = path.resolve(__dirname, "../stdlib");
 // is editing: a line from an imported file is reported at the import that brought it in.
 type SourceLine = { text: string, file: string, line: number, rootLine: number };
 
+// `@a/b` is a path from the main file's folder. If it isn't there, each folder above is tried in
+// turn, so a file checked on its own (the editor checks the open file as if it were the main one,
+// e.g. kernel/drivers/vga.l importing @lib/mem) still finds what a build from kernel.l would.
+function atPathCandidates(rel: string): string[] {
+    const out: string[] = [];
+    for (let dir = srcDir; ; dir = path.dirname(dir)) {
+        out.push(path.join(dir, `${rel}.l`));
+        if (path.dirname(dir) === dir) return out;
+    }
+}
+
 function resolveImports(src: string, file: string, rootLine: number | undefined, seen: Set<string>): SourceLine[] {
     const isRoot = rootLine === undefined;
     const fileDir = path.dirname(file);
     const out: SourceLine[] = [];
     src.split("\n").forEach((text, i) => {
         const at = rootLine ?? i + 1;
-        const m = /^import\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;?\s*$/.exec(text);
+        const m = /^import\s+(@[a-zA-Z_][a-zA-Z0-9_]*(?:\/[a-zA-Z_][a-zA-Z0-9_]*)*|[a-zA-Z_][a-zA-Z0-9_]*)\s*;?\s*$/.exec(text);
         if (!m) {
             out.push({ text, file, line: i + 1, rootLine: at });
             return;
         }
         const name = m[1];
-        const candidates = [...(isRoot ? [] : [path.join(fileDir, `${name}.l`)]),
-            path.join(rootHeadersDir, `${name}.l`),
-            path.join(stdlibDir, `${name}.l`)
-        ];
+        // `@path/to/file` is a path from the main file's folder, whichever file the import is in;
+        // a bare name is looked up next to the importing header, then in headers/ and stdlib/
+        const candidates = name.startsWith("@")
+            ? atPathCandidates(name.slice(1))
+            : [...(isRoot ? [] : [path.join(fileDir, `${name}.l`)]),
+                path.join(rootHeadersDir, `${name}.l`),
+                path.join(stdlibDir, `${name}.l`)
+            ];
         const resolved = candidates.find(c => fs.existsSync(c));
-        if (!resolved) throw new Error(`${at}:1: Cannot find module '${name}' (searched ${candidates.join(", ")})`);
+        if (!resolved) {
+            const searched = name.startsWith("@") ? `${candidates[0]} and the folders above it` : candidates.join(", ");
+            throw new Error(`${at}:1: Cannot find module '${name}' (searched ${searched})`);
+        }
 
         const canonical = path.resolve(resolved);
         out.push({ text: "", file, line: i + 1, rootLine: at });   // the import line itself
@@ -201,6 +220,9 @@ if (kernelMode) {
     if (mainFn) die(`${mainFn.line}:${mainFn.col}: --kernel: a kernel's entry point is kernel_main, not main`);
     if (!fns.some(f => f.value === "kernel_main")) die("--kernel: a kernel needs a kernel_main function (your boot code calls it)");
 }
+
+// a local or parameter named like a global gets its own name (the emitter treats a global's name as the global)
+renameShadowingLocals(optimizedAst);
 
 let IR: ReturnType<typeof IRGen>;
 try {

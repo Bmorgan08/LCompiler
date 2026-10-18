@@ -179,11 +179,13 @@ LIMIT = 11;           // error: Cannot assign to const variable 'LIMIT'
 
 `const` fixes the variable, not what it points to: the elements of a `const` array and the fields of a `const` struct can still be changed.
 
-Integer literals can be written in hexadecimal with a `0x` prefix:
+Integer literals can be written in hexadecimal with a `0x` prefix, or in binary with `0b`. A binary literal can have `_` between its digits to group them:
 
 ```
 var int red   = 0xFF0000;
 var int flags = 0x1F;
+var u8 ready  = 0b00100000;    // 32
+var int mask  = 0b1111_0000;   // 240
 ```
 
 ---
@@ -330,6 +332,8 @@ function greet(string name) {
 ```
 
 Parameters must be typed. `function` and `fn` are both accepted.
+
+A function that reaches its end without a `return` returns 0, and so does a bare `return;`, which is handy for leaving early: `if (n == 0) { return; }`.
 
 The return type can be written after the parameters with `:`. Without it, the return type is inferred from the `return` statements in the body:
 
@@ -802,7 +806,23 @@ L searches for the module in these places, in this order:
 
 The main source file only imports from `headers/` and `stdlib/`, not from `.l` files next to it.
 
-Duplicate imports are silently deduplicated — importing the same module twice has no effect.
+Duplicate imports are silently deduplicated — importing the same module twice has no effect. This works by file, so a file reached in two different ways is still only included once.
+
+### Imports by path
+
+An import that starts with `@` is a path from the main source file's folder, without the `.l`. This lets a larger program keep its files in folders:
+
+```
+import @arch/gdt;         // arch/gdt.l
+import @drivers/serial;   // drivers/serial.l
+import @util;             // util.l, next to the main file
+```
+
+- `@` always means the main file's folder, whichever file the import is in: `import @lib/mem;` means `lib/mem.l` in `main.l`, in `arch/gdt.l` and in `headers/a.l` alike. There are no `..` paths.
+- If the file isn't in the main file's folder, each folder above it is tried in turn. A build always starts from the main file, so this only matters when a file is compiled or checked on its own: the editor checks the file you have open as if it were the main one, and `kernel/drivers/vga.l` importing `@lib/mem` still finds `kernel/lib/mem.l`.
+- A path import never looks in `headers/` or `stdlib/`.
+- Folders in a path are separated by `/`. Each part of the path has to be a valid name (letters, digits and `_`, not starting with a digit).
+- Imports without `@` work as described above.
 
 An error inside an imported file is reported on the `import` line of your file, naming the imported file and the line in it: `Error: 2:1: in headers/utils.l at 5:9: ...`.
 

@@ -1302,8 +1302,11 @@ export function validate(node: Node, scope: Scope) {
             } else if (structName(inferredType)) {
                 structType = inferredType
             }
-            // a local may take the name of a function (var int len = len(s);)
-            if (!resolve(node.value!, scope) || resolve(node.value!, scope)!.kind === "func") {
+            // a new variable unless this scope already has it (a global, declared by Declare.ts, or a
+            // loop body validated for the second time). A local may take the name of a function
+            // (var int len = len(s);) or of a global, which it hides (B68).
+            const here = scope.symbols.get(node.value!);
+            if (!here || here.kind === "func") {
                 define(scope, {
                     name: node.value!,
                     kind: "var",
@@ -1638,6 +1641,8 @@ export function validate(node: Node, scope: Scope) {
             const sym = resolve(node.value!, scope);
             if (!sym) err(node, `Undefined variable: ${node.value}`);
             checkNotMoved(sym, node);
+            const t = String(sym.type);
+            if (t !== "unknown" && t !== "string" && !t.endsWith("[]") && !isMapType(t)) err(node, `.len() needs an array, map or string, not ${t}`);
             break;
         }
 

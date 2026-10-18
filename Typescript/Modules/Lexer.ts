@@ -70,6 +70,17 @@ export function LexerWithPos(src: string): Token[] {
                 i--;
                 // BigInt keeps every digit (parseInt rounds above 2^53)
                 tokens.push({ value: hex.length > 2 ? BigInt(hex).toString() : String(parseInt(hex, 16)), line: startLine, col: startCol });
+            } else if (c === "0" && (src[i + 1] === "b" || src[i + 1] === "B") && /[01]/.test(src[i + 2] ?? "")) {
+                // binary: 0b00100000
+                let bin = "0b";
+                i += 2; col += 2;
+                while (i < src.length && /[01_]/.test(src[i])) {
+                    if (src[i] !== "_") bin += src[i];
+                    i++; col++;
+                }
+                if (/[2-9]/.test(src[i] ?? "")) throw new Error(`${startLine}:${startCol}: '${src[i]}' isn't a binary digit`);
+                i--;
+                tokens.push({ value: BigInt(bin).toString(), line: startLine, col: startCol });
             } else {
                 let num = c;
                 while (i + 1 < src.length && /\d/.test(src[i + 1])) {

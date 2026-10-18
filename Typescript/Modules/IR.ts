@@ -364,8 +364,12 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
         return copy
     }
 
-    function isStringTemp(name: string): boolean {
+    // `seen` stops a loop of movs: names are looked up across all functions, so `slot = handler` in
+    // one function and `handler = slot` in another point at each other (B69)
+    function isStringTemp(name: string, seen: Set<string> = new Set()): boolean {
         if (stringVars.has(name)) return true;
+        if (seen.has(name)) return false;
+        seen.add(name);
         const producer = [...instructions].reverse().find(i =>
             'dst' in i && (i as any).dst === name
         );
@@ -376,7 +380,7 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
         if (producer.op === "mov") {
             const src = (producer as any).src;
             if (!isNaN(Number(src))) return false;
-            return isStringTemp(src);
+            return isStringTemp(src, seen);
         }
         return false;
     }
@@ -1358,7 +1362,10 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
                 const src = genExpr(node.children[0]);
                 if (declType) varTypes.set(node.value!, declType);
                 if (structT(declType)) structTypeMap.set(node.value!, declType!);
-                if (node.varType === "string" || declType === "string" || stringVars.has(src) || isStringTemp(src)) {
+                // a pointer is never a string, even ptr<u8>("text"): it points at the literal's bytes
+                // (which live as long as the program), so it isn't copied or freed
+                const isPointer = String(declType).startsWith("ptr<");
+                if (!isPointer && (node.varType === "string" || declType === "string" || stringVars.has(src) || isStringTemp(src))) {
                     stringVars.add(node.value!);
                 }
                 const srcIsFloat = floatTemps.has(src);
@@ -1545,6 +1552,8 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
 
             case "Match": {
                 const subject = genExpr(node.children[0]);
+                // a string subject is compared by its text, like ==, not by where it is stored (B70)
+                const stringSubject = typeOf(node.children[0]) === "string" || isStringTemp(subject);
                 const subjSlot = `__match_subj_${labelCount}`;
                 emit({ op: "mov", dst: subjSlot, src: subject });
                 const endLabel = freshLabel("match_end");
@@ -1558,7 +1567,7 @@ function generateIR(ast: Node, knownRetTypes: Map<string, string>, final: boolea
                         const nextLabel = freshLabel("match_next");
                         const patDst = genExpr(arm.children[0]);
                         const cmpDst = fresh();
-                        emit({ op: "eq", dst: cmpDst, a: subjSlot, b: patDst });
+                        emit({ op: stringSubject ? "str_eq" : "eq", dst: cmpDst, a: subjSlot, b: patDst });
                         emit({ op: "jz", cond: cmpDst, target: nextLabel });
                         genStmt(arm.children[1]);
                         emit({ op: "jmp", target: endLabel });

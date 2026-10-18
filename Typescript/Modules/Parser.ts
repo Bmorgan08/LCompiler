@@ -550,8 +550,82 @@ export function parseWithPos(tokens: Token[]): Node {
     return parseTokens(tokens);
 }
 
+// an expression that must use up all of its tokens: anything left over is an error instead of
+// being dropped (`var int x = 5 7;`, or a missing ';' that pulled the next line into this one)
+function parseWhole(toks: Token[]): Node {
+    const rest = [...toks];
+    let result: Node;
+    try {
+        result = parseExpression(rest);
+    } catch (e: any) {
+        // an error with no position of its own ("Unexpected end of input"): report where the expression starts
+        if (toks.length && !/^\d+:\d+:/.test(e.message)) err(`${e.message} in '${toks.map(t => t.value).join(" ")}'`, toks[0]);
+        throw e;
+    }
+    if (rest.length) {
+        const extra = rest[0];
+        const prev = toks[toks.length - rest.length - 1];
+        // `u8 status = ...` / `for (int i = 0; ...)`: a type where a declaration was meant
+        if (toks.length - rest.length === 1 && (BASIC_TYPES.includes(prev.value) || prev.value === "ptr"))
+            err(`A declaration starts with 'var': var ${prev.value} ${extra.value} ...`, prev);
+        if (prev && extra.line > prev.line) err(`Expected ';' after '${prev.value}'`, prev);
+        err(`Unexpected '${extra.value}'`, extra);
+    }
+    return result;
+}
+
 function parseTokens(tokens: Token[]): Node {
     const program: Node = { type: "Program", children: [] };
+
+    // the tokens between the '(' after `word` (if, while, match) and its matching ')', both eaten
+    function bracketed(word: string): Token[] {
+        const open = peekTok(tokens);
+        if (open?.value !== "(") err(`Expected '(' after '${word}'`, open);
+        eat(tokens);
+        const out: Token[] = [];
+        let depth = 1;
+        while (true) {
+            const tok = eatTok(tokens);
+            if (!tok) err(`Expected ')' to close the '(' after '${word}'`, open);
+            if (tok.value === "(") depth++;
+            else if (tok.value === ")") { depth--; if (depth === 0) break; }
+            out.push(tok);
+        }
+        if (out.length === 0) err(`Expected a condition after '${word}'`, open);
+        return out;
+    }
+
+    // `if (x = 0)` assigns instead of comparing: almost always a mistake
+    function checkCondition(cond: Node | null, word: string) {
+        if (cond && (cond.type === "Assign" || cond.type === "CompoundAssign")) {
+            err(`'=' in ${word === "if" ? "an" : "a"} ${word} condition assigns a value; to compare, use '=='`, cond as any);
+        }
+    }
+
+    // the tokens of a statement up to its ';' (which is eaten). A '}', ')' or ']' that closes
+    // something the statement didn't open, or the end of the file, means the ';' is missing.
+    function untilSemicolon(): Token[] {
+        const out: Token[] = [];
+        let depth = 0;
+        while (peek(tokens) !== ";" || depth > 0) {
+            const t = peekTok(tokens);
+            if (t && t.value === ";" && depth > 0) {
+                // only a for header has ';' inside brackets
+                const hint = out.length > 1 && /^[a-zA-Z_]/.test(out[0].value) && out[1].value === "("
+                    ? ` ('${out[0].value} (...; ...)' looks like a loop: did you mean 'for'?)` : "";
+                err(`Expected ')' before ';'${hint}`, out.length > 1 && hint ? out[0] : t);
+            }
+            if (!t || (depth === 0 && (t.value === "}" || t.value === ")" || t.value === "]"))) {
+                const last = out[out.length - 1];
+                err(last ? `Expected ';' after '${last.value}'` : `Expected ';'`, last ?? t);
+            }
+            if (t.value === "(" || t.value === "[" || t.value === "{") depth++;
+            if (t.value === ")" || t.value === "]" || t.value === "}") depth--;
+            out.push(eatTok(tokens));
+        }
+        eat(tokens);
+        return out;
+    }
 
     function assignTo(target: Node, value: Node, tok: Token): Node {
         const at = { line: tok.line, col: tok.col };
@@ -601,10 +675,10 @@ function parseTokens(tokens: Token[]): Node {
 
         if (t === "return") {
             const rtok = eatTok(tokens);
-            const exprTokens: Token[] = [];
-            while (peek(tokens) !== ";") exprTokens.push(eatTok(tokens)!);
-            eat(tokens);
-            return { type: "Return", children: [parseExpression(exprTokens)], line: rtok.line, col: rtok.col };
+            const exprTokens = untilSemicolon();
+            // `return;` on its own returns 0, like reaching the end of the function
+            const value: Node = exprTokens.length ? parseWhole(exprTokens) : { type: "Number", value: "0", children: [], line: rtok.line, col: rtok.col };
+            return { type: "Return", children: [value], line: rtok.line, col: rtok.col };
         }
 
         if (t === "var" || t === "let" || t === "const") {
@@ -612,15 +686,12 @@ function parseTokens(tokens: Token[]): Node {
             const varType = parseTypeAnnotation(tokens);
             const name = eat(tokens);
             eat(tokens);
-            const exprTokens: Token[] = [];
-            while (peek(tokens) !== ";") exprTokens.push(eatTok(tokens)!);
-            eat(tokens);
-            return { type: "VarDecl", value: name, varType, isConst: t === "const", children: [parseExpression(exprTokens)], line: vtok.line, col: vtok.col };
+            const exprTokens = untilSemicolon();
+            if (!exprTokens.length) err(`Expected a value after '=' for ${name}`, vtok);
+            return { type: "VarDecl", value: name, varType, isConst: t === "const", children: [parseWhole(exprTokens)], line: vtok.line, col: vtok.col };
         }
 
-        const exprTokens: Token[] = [];
-        while (peek(tokens) !== ";") exprTokens.push(eatTok(tokens)!);
-        eat(tokens);
+        const exprTokens = untilSemicolon();
 
         // an assignment: the target is parsed as an ordinary expression and turned into the
         // matching assignment node (x = v, a[i] = v, m[i][j] = v, p.f = v, ps[i].f = v, d.tags[i] = v)
@@ -635,8 +706,9 @@ function parseTokens(tokens: Token[]): Node {
         };
         const eqIdx = exprTokens.findIndex((t, i) => t.value === "=" && topLevel(i));
         if (eqIdx > 0) {
-            const target = parseExpression(exprTokens.slice(0, eqIdx));
-            const value = parseExpression(exprTokens.slice(eqIdx + 1));
+            const target = parseWhole(exprTokens.slice(0, eqIdx));
+            if (eqIdx === exprTokens.length - 1) err(`Expected a value after '='`, exprTokens[eqIdx]);
+            const value = parseWhole(exprTokens.slice(eqIdx + 1));
             return assignTo(target, value, exprTokens[0]);
         }
 
@@ -644,9 +716,9 @@ function parseTokens(tokens: Token[]): Node {
         if (compIdx > 1) {
             // a[i] += v and p.f += v become a[i] = a[i] + v (the target is parsed twice)
             const op = exprTokens[compIdx].value;
-            const target = parseExpression(exprTokens.slice(0, compIdx));
-            const current = parseExpression(exprTokens.slice(0, compIdx));
-            const rhs = parseExpression(exprTokens.slice(compIdx + 1));
+            const target = parseWhole(exprTokens.slice(0, compIdx));
+            const current = parseWhole(exprTokens.slice(0, compIdx));
+            const rhs = parseWhole(exprTokens.slice(compIdx + 1));
             const value: Node = { type: "Binary", value: op.slice(0, -1), children: [current, rhs], line: exprTokens[0].line, col: exprTokens[0].col, compound: true };
             return assignTo(target, value, exprTokens[0]);
         }
@@ -658,7 +730,7 @@ function parseTokens(tokens: Token[]): Node {
             const rhs = exprTokens.slice(compOpIdx + 1);
             return {
                 type: "CompoundAssign", value: op,
-                children: [{ type: "Identifier", value: name, children: [] }, parseExpression(rhs)],
+                children: [{ type: "Identifier", value: name, children: [] }, parseWhole(rhs)],
                 line: exprTokens[0].line, col: exprTokens[0].col
             };
         }
@@ -676,21 +748,14 @@ function parseTokens(tokens: Token[]): Node {
             };
         }
 
-        return parseExpression(exprTokens);
+        return parseWhole(exprTokens);
     }
 
     function parseWhile(): Node {
         const wtok = peekTok(tokens);
-        eat(tokens);
-        const condTokens: Token[] = [];
-        let depth = 1;
-        while (depth > 0) {
-            const tok = eatTok(tokens)!;
-            if (tok.value === "(") depth++;
-            else if (tok.value === ")") { depth--; if (depth === 0) break; }
-            condTokens.push(tok);
-        }
-        const cond = parseExpression(condTokens);
+        const condTokens = bracketed("while");
+        const cond = parseWhole(condTokens);
+        checkCondition(cond, "while");
         eat(tokens);
         const body = parseBlockBody();
         eat(tokens);
@@ -699,6 +764,7 @@ function parseTokens(tokens: Token[]): Node {
 
     function parseFor(): Node {
         const ftok = peekTok(tokens);
+        if (ftok?.value !== "(") err("Expected '(' after 'for'", ftok);
         eat(tokens);
 
         const saved = [...tokens];
@@ -723,26 +789,12 @@ function parseTokens(tokens: Token[]): Node {
             return {
                 type: "ForIn",
                 value: varName,
-                children: [parseExpression(iterTokens), body],
+                children: [parseWhole(iterTokens), body],
                 line: ftok?.line, col: ftok?.col
             };
         }
 
-        const initTokens: Token[] = [];
-        while (peek(tokens) !== ";") initTokens.push(eatTok(tokens)!);
-        eat(tokens);
-
-        const condTokens: Token[] = [];
-        while (peek(tokens) !== ";") condTokens.push(eatTok(tokens)!);
-        eat(tokens);
-
-        const updateTokens: Token[] = [];
-        while (peek(tokens) !== "{") updateTokens.push(eatTok(tokens)!);
-
-        eat(tokens);
-        const body = parseBlockBody();
-        eat(tokens);
-
+        const initTokens = untilSemicolon();
         let init: Node | null = null;
         if (initTokens.length) {
             if (initTokens[0].value === "var" || initTokens[0].value === "let" || initTokens[0].value === "const") {
@@ -751,14 +803,28 @@ function parseTokens(tokens: Token[]): Node {
                 const name = rest.shift()!.value;
                 rest.shift();   // =
                 const exprTokens = rest;
-                init = { type: "VarDecl", value: name, varType, isConst: initTokens[0].value === "const", children: [parseExpression(exprTokens)] };
+                init = { type: "VarDecl", value: name, varType, isConst: initTokens[0].value === "const", children: [parseWhole(exprTokens)] };
             } else {
-                init = parseExpression(initTokens);
+                init = parseWhole(initTokens);
             }
         }
 
-        const cond = condTokens.length ? parseExpression(condTokens) : null;
-        const update = updateTokens.length ? parseExpression(updateTokens) : null;
+        const condTokens = untilSemicolon();
+
+        const updateTokens: Token[] = [];
+        while (peek(tokens) !== "{") {
+            if (!tokens.length) err("Expected '{' after for (...)", ftok);
+            updateTokens.push(eatTok(tokens)!);
+        }
+        if (updateTokens[updateTokens.length - 1]?.value === ")") updateTokens.pop();   // the for's own ')'
+
+        eat(tokens);
+        const body = parseBlockBody();
+        eat(tokens);
+
+        const cond = condTokens.length ? parseWhole(condTokens) : null;
+        checkCondition(cond, "for");
+        const update = updateTokens.length ? parseWhole(updateTokens) : null;
 
         const forNode: Node = { type: "For", children: [], line: ftok?.line, col: ftok?.col };
         if (init) forNode.children.push(init);
@@ -770,16 +836,9 @@ function parseTokens(tokens: Token[]): Node {
 
     function parseMatch(): Node {
         const mtok = peekTok(tokens);
-        eat(tokens);
-        const subjTokens: Token[] = [];
-        let depth = 1;
-        while (depth > 0) {
-            const tok = eatTok(tokens)!;
-            if (tok.value === "(") depth++;
-            else if (tok.value === ")") { depth--; if (depth === 0) break; }
-            subjTokens.push(tok);
-        }
-        const subject = parseExpression(subjTokens);
+        const subjTokens = bracketed("match");
+        const subject = parseWhole(subjTokens);
+        checkCondition(subject, "match");
         eat(tokens);
         const arms: Node[] = [];
         while (peek(tokens) !== "}") {
@@ -797,7 +856,7 @@ function parseTokens(tokens: Token[]): Node {
                 eat(tokens);
                 const body = parseBlockBody();
                 eat(tokens);
-                const pattern = parseExpression(patternTokens);
+                const pattern = parseWhole(patternTokens);
                 arms.push({ type: "MatchArm", children: [pattern, body] });
             }
         }
@@ -831,13 +890,14 @@ function parseTokens(tokens: Token[]): Node {
             eat(tokens);
             const fieldType = (parseTypeAnnotation(tokens)) ?? eat(tokens) as Ltype;
             // an optional default: var tags: int[] = [];
-            const defaultTokens: Token[] = [];
+            let defaultTokens: Token[] = [];
             if (peek(tokens) === "=") {
                 eat(tokens);
-                while (peek(tokens) !== ";") defaultTokens.push(eatTok(tokens)!);
+                defaultTokens = untilSemicolon();
+            } else {
+                eat(tokens);
             }
-            eat(tokens);
-            const f: Node = { type: "StructField", value: fieldName, varType: fieldType, children: defaultTokens.length ? [parseExpression(defaultTokens)] : [] };
+            const f: Node = { type: "StructField", value: fieldName, varType: fieldType, children: defaultTokens.length ? [parseWhole(defaultTokens)] : [] };
             if (mut === "const") f.isConst = true;
             fields.push(f);
         }
@@ -860,16 +920,9 @@ function parseTokens(tokens: Token[]): Node {
     }
 
     function parseIf(): Node {
-        eat(tokens);
-        const condTokens: Token[] = [];
-        let depth = 1;
-        while (depth > 0) {
-            const tok = eatTok(tokens)!;
-            if (tok.value === "(") depth++;
-            else if (tok.value === ")") { depth--; if (depth === 0) break; }
-            condTokens.push(tok);
-        }
-        const cond = parseExpression(condTokens);
+        const condTokens = bracketed("if");
+        const cond = parseWhole(condTokens);
+        checkCondition(cond, "if");
         eat(tokens);
         const thenBlock = parseBlockBody();
         eat(tokens);
@@ -894,7 +947,11 @@ function parseTokens(tokens: Token[]): Node {
 
     function parseBlockBody(): Node {
         const body: Node = { type: "Block", children: [] };
-        while (peek(tokens) !== "}") body.children.push(parseStatement());
+        while (peek(tokens) !== "}") {
+            if (!tokens.length) err("Expected '}' before the end of the file");
+            if (peek(tokens) === ";") { eat(tokens); continue; }   // empty statement
+            body.children.push(parseStatement());
+        }
         return body;
     }
 
@@ -950,6 +1007,7 @@ function parseTokens(tokens: Token[]): Node {
         const tok = eatTok(tokens);
         if (!tok) break;
         const t = tok.value;
+        if (t === ";") continue;   // empty statement (`};` after a function)
 
         // interrupt fn name(ptr<InterruptFrame> frame[, u64 error_code]) { ... }
         const isInterrupt = t === "interrupt" && (peek(tokens) === "fn" || peek(tokens) === "function");
@@ -998,10 +1056,9 @@ function parseTokens(tokens: Token[]): Node {
             const varType = parseTypeAnnotation(tokens);
             const name = eat(tokens)!;
             eat(tokens);
-            const expr: Token[] = [];
-            while (peek(tokens) !== ";") expr.push(eatTok(tokens)!);
-            eat(tokens);
-            program.children.push({ type: "VarDecl", value: name, varType, isConst: t === "const", children: [parseExpression(expr)], line: tok.line, col: tok.col });
+            const expr = untilSemicolon();
+            if (!expr.length) err(`Expected a value after '=' for ${name}`, tok);
+            program.children.push({ type: "VarDecl", value: name, varType, isConst: t === "const", children: [parseWhole(expr)], line: tok.line, col: tok.col });
             continue;
         }
 

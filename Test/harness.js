@@ -7,6 +7,7 @@
 //   exact      compare stdout exactly, without trimming
 //   stdin      text fed to the program
 //   files      extra files to write next to the source, e.g. { "headers/util.l": "..." }
+//   mainPath   where the source is written, relative to the test folder (default main.l); files are still relative to the test folder
 //   shouldError  compilation must fail; errorMatch (RegExp) is checked against the compiler's stderr
 //   exitCode   expected exit status of the program (default 0 is not checked unless set)
 //   stderrMatch  RegExp the program's stderr must match (e.g. a runtime error message)
@@ -80,8 +81,9 @@ function run(cmd, args, opts) {
 async function runTest(test, flags) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ltest-"));
     try {
-        const src = path.join(dir, "main.l");
+        const src = path.join(dir, test.mainPath ?? "main.l");
         const bin = path.join(dir, "main");
+        fs.mkdirSync(path.dirname(src), { recursive: true });
         fs.writeFileSync(src, test.source);
         for (const [rel, content] of Object.entries(test.files ?? {})) {
             fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });

@@ -130,7 +130,12 @@ export function emitNASM(instructions: IR[], options: { kernel?: boolean } = {})
             }
             const entry = options.kernel ? "kernel_main" : "main";
             const mainEnterIdx = instructions.findIndex(i => i.op === "enter" && (i as any).name === entry);
-            const insertAfter = mainEnterIdx >= 0 ? mainEnterIdx + 1 : 1;
+            // after the entry function saves its arguments: setting up globals makes calls, which
+            // overwrite the argument registers (kernel_main(u64 multiboot_info) gets them from boot code)
+            let insertAfter = mainEnterIdx >= 0 ? mainEnterIdx + 1 : 1;
+            for (let k = insertAfter; k < instructions.length && instructions[k].op !== "enter"; k++) {
+                if (instructions[k].op === "arg") insertAfter = k + 1;
+            }
             instructions.splice(insertAfter, 0, ...globalInits);
         }
     }

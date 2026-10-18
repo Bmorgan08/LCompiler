@@ -369,7 +369,72 @@ module.exports = {
                "(over VGA memory). Found by the timer example.",
         fixed: "Emitter.ts: a global given a plain number (and not set again before main) is stored in .data with that value, so it holds it from the start.",
     },
-
+    B63: {
+        title: "A kernel_main parameter was overwritten while globals were set up",
+        cause: "Emitter.ts:132-134 - global initialisers are spliced in right after the entry function's enter, before its arg instructions save the " +
+               "argument registers. Setting up a heap global calls strlen/malloc/strcpy, which overwrite rdi, so kernel_main(u64 multiboot_info) " +
+               "read a heap address instead of what the boot code passed. Found while writing apollOS's boot code.",
+        fixed: "Emitter.ts: global initialisers go after the entry function's last arg instruction, once the argument registers are saved.",
+    },
+    B64: {
+        title: "Tokens left over after an expression were dropped, so a missing ';' went unnoticed",
+        cause: "Parser.ts - statements collect tokens up to the next ';' and parseExpression stops after one expression, silently ignoring the rest: " +
+               "`var int x = 5 7 banana;` printed 5, and a missing ';' pulled the next line into the statement, where it never ran. With no ';' left in the " +
+               "file the collecting loops pushed undefined forever (\"Invalid array length\"); `};` after a block gave \"Unexpected end of input\" with no line. " +
+               "Found in apollOS's kernel.l.",
+        fixed: "Parser.ts: untilSemicolon() collects a statement and reports \"Expected ';' after 'x'\" at an unopened '}', ')' or ']' or the end of the file; " +
+               "parseWhole() rejects leftover tokens (\"Unexpected 'x'\", or the missing ';' when they start on a later line, or a hint to use 'var' after a type name); " +
+               "a lone ';' is an empty statement.",
+    },
+    B65: {
+        title: "Binary literals (0b1010) were read as 0",
+        cause: "Lexer.ts - only 0x was recognised, so 0b00100000 became the number 0 and the name b00100000, which B64 then dropped. " +
+               "A serial-port ready check masked with it never succeeded.",
+        fixed: "Lexer.ts: 0b/0B literals, with optional '_' between digits; a digit other than 0 or 1 is an error.",
+    },
+    B66: {
+        title: "ptr<u8>(\"text\") stored in a variable copied the literal onto the heap",
+        cause: "IR.ts VarDecl - a Cast passes its operand through, so the value still looked like a string literal and the variable was made a string " +
+               "owner (str_dup). In a kernel with no kernel_alloc_pages that halted silently, although LANGUAGE.md says the cast doesn't allocate.",
+        fixed: "IR.ts VarDecl: a variable of a pointer type is never a string variable, so it points at the literal's bytes.",
+    },
+    B67: {
+        title: "name.len() was accepted on any type, including pointers",
+        cause: "Validate.ts - `name.len()` parses to ArrayLen, which only checked that the variable exists (LenExpr, for other expressions, checked the type).",
+        fixed: "Validate.ts ArrayLen: the same type check as LenExpr (an array, map or string).",
+    },
+    B68: {
+        title: "A parameter or local named like a global read and wrote the global",
+        cause: "Emitter.ts memRef() sends any name that is a global to [rel __g_name], whatever scope it was declared in, so `console_set_colour(u8 colour)` " +
+               "changed the global `colour`, and so did every call passing a `colour` argument (the arg instruction stored into the global). Validate.ts VarDecl also " +
+               "reused the global's symbol for a local of the same name (it only made a new one when resolve() found nothing), so returning such a local array " +
+               "was rejected as returning a global. Found in apollOS's console.l.",
+        fixed: "Shadow.ts renameShadowingLocals() (run after validation, before IR generation) gives a parameter or local named like a global its own name (colour$1) " +
+               "and renames its uses within its scope; Validate.ts VarDecl makes a new symbol unless the current scope already has one.",
+    },
+    B69: {
+        title: "Two functions copying a global into the same local name made the compiler recurse forever",
+        cause: "IR.ts isStringTemp() follows mov chains by name across every function generated so far. With `slot = handler` in one function and " +
+               "`var ... handler = slot` in two others, `handler` and `slot` each led to the other, so it recursed until \"Maximum call stack size exceeded\". " +
+               "Found in apollOS's irq.l (16 IRQ stubs each copying irq_handler_N into a local called handler).",
+        fixed: "IR.ts isStringTemp() carries the set of names already followed and stops at one it has seen.",
+    },
+    B70: {
+        title: "match on a string compared addresses, so a string never matched its text",
+        cause: "IR.ts Match compared the subject with each pattern using eq (the pointers), so `match (line) { \"help\" => ... }` only matched the very same " +
+               "string object; a string typed with inputstr() or built at runtime always fell through to _. == on strings used str_eq. Found in apollOS's shell.",
+        fixed: "IR.ts Match: a string subject is compared with str_eq, the same as ==.",
+    },
+    B71: {
+        title: "Small syntax mistakes gave errors with no line, crashed the compiler, or compiled",
+        cause: "Parser.ts - `return;` and a misspelled keyword like `from (...; ...)` reached parseExpression with nothing left and threw \"Unexpected end of input\" " +
+               "with no position; parseIf/parseWhile/parseMatch skipped the token after the keyword assuming it was '(' and ran off the end looking for ')', " +
+               "crashing with \"Cannot read properties of undefined\" (`if header = 0 {`); `if (x = 0)` parsed as an assignment and compiled, always taking " +
+               "the else branch. Found writing apollOS's shell (cat printed thousands of junk bytes).",
+        fixed: "Parser.ts: `return;` returns 0; bracketed() requires the '(' and its ')' after if/while/match (and for checks its '('); checkCondition() rejects " +
+               "'=' in an if/while/for/match condition; a ';' inside unclosed brackets is \"Expected ')' before ';'\" with a 'did you mean for?' hint; " +
+               "a missing value after '=' is reported at the declaration; parseWhole() adds the expression's position to errors that had none.",
+    },
     S1: {
         title: "math_sqrt is inaccurate for large and tiny inputs",
         cause: "stdlib/math.l math_sqrt - a fixed 20 Newton iterations from x/2 is not enough to converge far from 1 (sqrt(1e12) gives 1030620).",

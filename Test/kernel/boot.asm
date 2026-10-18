@@ -40,6 +40,7 @@ bits 32
 global _start
 _start:
     mov esp, stack_top
+    mov edi, ebx                        ; Multiboot info: kernel_main's first argument
 
     ; PML4[0] -> PDPT, PDPT[0] -> page directory (present | writable)
     mov eax, pdpt
@@ -98,6 +99,7 @@ long_mode:
 
     mov rsp, stack_top
     xor rbp, rbp
+    mov edi, edi                        ; clear the top half of rdi
     call kernel_main
 
 .hang:
